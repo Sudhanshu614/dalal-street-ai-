@@ -1,9 +1,14 @@
 # API Backend Requirements
 # Senior Dev: Backend dependencies for FastAPI server
 
-fastapi>=0.104.0
+fastapi>=0.100.0
+pydantic>=2.0.0
 uvicorn[standard]>=0.24.0
-pydantic>=2.4.0
 google-generativeai>=0.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+python-dateutil>=2.8.0
+pytz>=2023.3
 
 # Note: Other dependencies (jugaad-data, nselib) already in main requirements.txt
