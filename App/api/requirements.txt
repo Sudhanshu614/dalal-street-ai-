@@ -48,7 +48,9 @@ git+https://github.com/jugaad-py/jugaad-data.git
 
 # nselib: NSE API wrapper for capital market and derivatives data
 # Requires: pandas, scipy, requests (all installed above)
+# ALSO requires pandas_market_calendars (undeclared dependency - install first)
 # Pinned to tested version from local environment
+pandas_market_calendars>=4.0.0
 nselib==1.9
 
 # jugaad-data will install its own pinned dependencies:
