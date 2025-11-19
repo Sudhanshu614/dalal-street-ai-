@@ -1,14 +1,57 @@
 # API Backend Requirements
-# Senior Dev: Backend dependencies for FastAPI server
+# Production-tested dependencies matching local development environment
 
+# ============================================
+# CORE FRAMEWORK
+# ============================================
 fastapi>=0.100.0
 pydantic>=2.0.0
 uvicorn[standard]>=0.24.0
-google-generativeai>=0.3.0
-pandas>=2.0.0
+python-dotenv>=1.0.0
+
+# ============================================
+# DATA PROCESSING (Install before scipy)
+# ============================================
+# Note: Order matters - numpy must be installed before scipy
 numpy>=1.24.0
+pandas>=2.0.0
+
+# ============================================
+# SCIENTIFIC COMPUTING
+# ============================================
+# scipy is required by nselib - install before nselib
+# May require system packages: build-essential, gfortran, libatlas-base-dev
+scipy>=1.11.0
+
+# ============================================
+# LLM INTEGRATION
+# ============================================
+google-generativeai>=0.3.0
+
+# ============================================
+# UTILITIES
+# ============================================
 requests>=2.31.0
 python-dateutil>=2.8.0
 pytz>=2023.3
 
-# Note: Other dependencies (jugaad-data, nselib) already in main requirements.txt
+# ============================================
+# LIVE MARKET DATA SOURCES
+# ============================================
+# These require compiled dependencies (numpy, scipy) installed above
+
+# jugaad-data: NSE historical and live data
+# Source: GitHub (not available on PyPI)
+# Requires: appdirs, beautifulsoup4, click, requests
+# Version: 0.29 (as tested locally)
+git+https://github.com/jugaad-py/jugaad-data.git
+
+# nselib: NSE API wrapper for capital market and derivatives data
+# Requires: pandas, scipy, requests (all installed above)
+# Pinned to tested version from local environment
+nselib==1.9
+
+# Additional jugaad-data dependencies (explicit for build reliability)
+appdirs>=1.4.4
+beautifulsoup4>=4.12.0
+click>=8.1.0

@@ -34,8 +34,8 @@ class Config:
         self.PROJECT_ROOT = Path(__file__).parent
 
         # Default paths (override if needed)
-        self.DB_PATH = self.PROJECT_ROOT / "Database" / "stock_market_new.db"
-        self.CSV_DIRECTORY = self.PROJECT_ROOT / "Database"
+        self.DB_PATH = self.PROJECT_ROOT / "database" / "stock_market_new.db"
+        self.CSV_DIRECTORY = self.PROJECT_ROOT / "database"
 
         # LLM Configuration (read from environment variables)
         # IMPORTANT: Do NOT commit real API keys into source control. Use environment variables or secret managers.

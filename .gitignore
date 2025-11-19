@@ -11,5 +11,19 @@ App/scriptsrebuild/
 App/tests/
 App/docker-compose.yml
 App/start_app.bat
-# Allow minimal starter database (small file)
+
+# ============================================
+# DATABASE FILES
+# ============================================
+
+# Exclude LARGE production databases (1GB+)
+App/database/stock_market_new.db
+App/database/stock_market_backup_*.db
+
+# EXCEPTION: Include minimal starter database (small, needed for deployment)
 !App/database/stock_market_minimal.db
+
+# Alternative pattern (achieves the same thing):
+# If above doesn't work, comment it out and use this instead:
+# App/database/*.db
+# !App/database/stock_market_minimal.db

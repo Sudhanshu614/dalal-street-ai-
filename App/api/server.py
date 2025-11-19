@@ -507,8 +507,8 @@ async def _startup_event_legacy():
 
     logger.info("[1/3] Initializing UniversalDataFetcher...")
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    db_path = os.path.join(project_root, 'Database', 'stock_market_new.db')
-    csv_dir = os.path.join(project_root, 'Database')
+    db_path = str(getattr(config, 'DB_PATH', os.path.join(project_root, 'database', 'stock_market_new.db')))
+    csv_dir = str(getattr(config, 'CSV_DIRECTORY', os.path.join(project_root, 'database')))
     fetcher = UniversalDataFetcher(db_path, csv_dir)
     logger.info(f"-> Data fetcher ready (database: {fetcher.db_path})")
 
