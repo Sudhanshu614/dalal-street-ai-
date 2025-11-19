@@ -352,8 +352,15 @@ async def lifespan(app: FastAPI):
     logger.info("STOCK MARKET AI BACKEND - STARTING UP")
     logger.info("=" * 80)
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    db_path = os.path.join(project_root, 'Database', 'stock_market_new.db')
-    csv_dir = os.path.join(project_root, 'Database')
+    # Check if running on Render with persistent disk
+    if os.path.exists('/data/stock_market_new.db'):
+        db_path = '/data/stock_market_new.db'
+        print("Using Render persistent disk for database")
+    else:
+    # Local development
+        db_path = os.path.join(project_root, 'database', 'stock_market_new.db')
+        print(f"Using local database at: {db_path}")
+    csv_dir = os.path.join(project_root, 'database')
     fetcher = UniversalDataFetcher(db_path, csv_dir)
     logger.info(f"-> Data fetcher ready (database: {fetcher.db_path})")
     api_key = config.GEMINI_API_KEY
