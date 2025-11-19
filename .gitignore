@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+App/.env
+App/api/.venv/
+logs/
+context.txt
+App/database/*.db
+*.db
+App/scriptsrebuild/
+App/tests/
+App/docker-compose.yml
+App/start_app.bat
+App/src
