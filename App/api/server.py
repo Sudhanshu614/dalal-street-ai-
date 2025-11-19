@@ -357,9 +357,16 @@ async def lifespan(app: FastAPI):
         db_path = '/data/stock_market_new.db'
         print("Using Render persistent disk for database")
     else:
-    # Local development
-        db_path = os.path.join(project_root, 'database', 'stock_market_new.db')
-        print(f"Using local database at: {db_path}")
+        # Check for minimal database first (for Render initial deployment)
+        minimal_db = os.path.join(project_root, 'database', 'stock_market_minimal.db')
+        full_db = os.path.join(project_root, 'database', 'stock_market_new.db')
+    
+        if os.path.exists(minimal_db) and not os.path.exists(full_db):
+            db_path = minimal_db
+            print(f"Using minimal starter database at: {db_path}")
+        else:
+            db_path = full_db
+            print(f"Using local database at: {db_path}")
     csv_dir = os.path.join(project_root, 'database')
     fetcher = UniversalDataFetcher(db_path, csv_dir)
     logger.info(f"-> Data fetcher ready (database: {fetcher.db_path})")

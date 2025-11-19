@@ -11,4 +11,5 @@ App/scriptsrebuild/
 App/tests/
 App/docker-compose.yml
 App/start_app.bat
-App/src
+# Allow minimal starter database (small file)
+!App/database/stock_market_minimal.db
