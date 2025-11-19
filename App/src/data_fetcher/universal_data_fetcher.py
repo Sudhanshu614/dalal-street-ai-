@@ -53,9 +53,11 @@ except ImportError:
 try:
     from nselib import capital_market, derivatives
     NSELIB_AVAILABLE = True
-except ImportError:
+except Exception as e:
     NSELIB_AVAILABLE = False
-    print("WARNING: nselib not installed. Install with: pip install nselib")
+    # Log actual error for debugging (nselib installed but import fails)
+    import sys
+    print(f"[DEBUG] nselib import failed: {type(e).__name__}: {str(e)}", file=sys.stderr)
 
 try:
     from talib import abstract as ta_abstract
