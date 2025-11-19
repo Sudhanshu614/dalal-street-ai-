@@ -35,7 +35,8 @@ try:
     NSELIB_AVAILABLE = True
 except ImportError:
     NSELIB_AVAILABLE = False
-    print("[WARN] nselib not available for bhavcopy download")
+    # Note: nselib may fail to import in some contexts due to module loading order
+    # This is non-fatal - system will use alternate data sources (jugaad-data, NSE Archives)
 
 
 class BhavcopyDownloader:
