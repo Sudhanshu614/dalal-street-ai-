@@ -51,7 +51,6 @@ git+https://github.com/jugaad-py/jugaad-data.git
 # Pinned to tested version from local environment
 nselib==1.9
 
-# Additional jugaad-data dependencies (explicit for build reliability)
-appdirs>=1.4.4
-beautifulsoup4>=4.12.0
-click>=8.1.0
+# jugaad-data will install its own pinned dependencies:
+# - appdirs, beautifulsoup4, click, requests
+# We don't specify them to avoid version conflicts
