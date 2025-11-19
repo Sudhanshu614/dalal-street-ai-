@@ -1,0 +1,5 @@
+# Ensure database files are treated as binary (not text)
+*.db binary
+
+# Ensure minimal database is not corrupted by line ending conversions
+App/database/stock_market_minimal.db binary
