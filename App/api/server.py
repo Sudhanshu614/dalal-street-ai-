@@ -937,7 +937,7 @@ async def list_functions():
 async def admin_update_bhavcopy(date: Optional[str] = None):
     try:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        db_path = os.path.join(project_root, 'Database', 'stock_market_new.db')
+        db_path = os.path.join(project_root, 'database', 'stock_market_new.db')
         downloader = BhavcopyDownloader(db_path)
         from datetime import datetime
         dt = datetime.strptime(date, '%Y-%m-%d') if date else None
@@ -954,8 +954,8 @@ async def admin_update_bhavcopy(date: Optional[str] = None):
 async def admin_update_corporate_actions(limit: Optional[int] = None):
     try:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        db_path = os.path.join(project_root, 'Database', 'stock_market_new.db')
-        csv_dir = os.path.join(project_root, 'Database')
+        db_path = os.path.join(project_root, 'database', 'stock_market_new.db')
+        csv_dir = os.path.join(project_root, 'database')
         import glob
         files = sorted(glob.glob(os.path.join(csv_dir, 'CF-CA-*.csv')))
         csv_path = files[-1] if files else None

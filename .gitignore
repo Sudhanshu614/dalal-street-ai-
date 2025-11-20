@@ -5,25 +5,32 @@ App/.env
 App/api/.venv/
 logs/
 context.txt
-App/database/*.db
-*.db
-App/scriptsrebuild/
+
+# IDE/Editor folders
+.trae/
+.vscode/
+.idea/
+
+# Testing
 App/tests/
+
+# Deployment scripts (local use only)
 App/docker-compose.yml
 App/start_app.bat
+
+# Scripts (experimental/personal workflows)
+App/scriptsrebuild/
+
+# Google Cloud credentials
+gcp-service-account.json
+*.json
 
 # ============================================
 # DATABASE FILES
 # ============================================
 
-# Exclude LARGE production databases (1GB+)
+# All database files excluded
+App/database/*.db
+*.db
 App/database/stock_market_new.db
 App/database/stock_market_backup_*.db
-
-# EXCEPTION: Include minimal starter database (small, needed for deployment)
-!App/database/stock_market_minimal.db
-
-# Alternative pattern (achieves the same thing):
-# If above doesn't work, comment it out and use this instead:
-# App/database/*.db
-# !App/database/stock_market_minimal.db

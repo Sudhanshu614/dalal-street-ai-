@@ -160,8 +160,10 @@ class UniversalDataFetcher:
         if not self.csv_directory or not self.csv_directory.exists():
             return None
 
-        # Find all CSV files matching pattern
+        # Find all CSV files matching patterns
         csv_files = list(self.csv_directory.glob('CF-CA-equities-*.csv'))
+        if not csv_files:
+            csv_files = list(self.csv_directory.glob('CF-CA-*.csv'))
 
         if not csv_files:
             # No CSV files found
@@ -172,7 +174,7 @@ class UniversalDataFetcher:
             return csv_files[0]
 
         # Multiple files - select most recent by filename
-        # Files are named: CF-CA-equities-01-01-2000-to-28-10-2025.csv
+        # Files are named like CF-CA-equities-01-01-2000-to-28-10-2025.csv or CF-CA-*.csv
         # Sort by name (lexicographic) - later dates will be last
         csv_files.sort()
         latest_file = csv_files[-1]  # Last one is most recent

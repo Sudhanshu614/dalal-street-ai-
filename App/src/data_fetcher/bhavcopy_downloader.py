@@ -35,8 +35,7 @@ try:
     NSELIB_AVAILABLE = True
 except ImportError:
     NSELIB_AVAILABLE = False
-    # Note: nselib may fail to import in some contexts due to module loading order
-    # This is non-fatal - system will use alternate data sources (jugaad-data, NSE Archives)
+    print("[WARN] nselib not available for bhavcopy download")
 
 
 class BhavcopyDownloader:
@@ -285,57 +284,6 @@ class BhavcopyDownloader:
             data_source
         ))
         self.conn.commit()
-
-        # Persist OHLCV into daily_ohlc for this date (idempotent)
-        try:
-            cursor = self.conn.cursor()
-            def _num(v):
-                try:
-                    return float(v)
-                except Exception:
-                    return None
-            for _, row in equity_df.iterrows():
-                sym = str(row.get('SYMBOL') or '').strip().upper()
-                if not sym:
-                    continue
-                # Map common bhavcopy headers
-                o = row.get('OPEN') if 'OPEN' in row else row.get('Open')
-                if o is None:
-                    o = row.get('OPEN_PRICE')
-                h = row.get('HIGH') if 'HIGH' in row else row.get('High')
-                if h is None:
-                    h = row.get('HIGH_PRICE')
-                l = row.get('LOW') if 'LOW' in row else row.get('Low')
-                if l is None:
-                    l = row.get('LOW_PRICE')
-                c = row.get('CLOSE') if 'CLOSE' in row else row.get('Close')
-                if c is None:
-                    c = row.get('CLOSE_PRICE')
-                v = None
-                for cand in ('TOTTRDQTY', 'Total Traded Quantity', 'VOLUME', 'Volume', 'TTL_TRD_QNTY'):
-                    if cand in row and str(row.get(cand)).strip() != '':
-                        v = row.get(cand)
-                        break
-                o = _num(o); h = _num(h); l = _num(l); c = _num(c)
-                try:
-                    cursor.execute(
-                        """
-                        INSERT OR IGNORE INTO daily_ohlc (symbol, date, open, high, low, close, volume, data_source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            sym,
-                            date.strftime('%Y-%m-%d'),
-                            o, h, l, c,
-                            int(v) if v is not None and str(v).strip().isdigit() else None,
-                            data_source
-                        )
-                    )
-                except Exception:
-                    pass
-            self.conn.commit()
-        except Exception:
-            pass
 
         # Update stocks_master table (mark inactive tickers)
         if disappeared_tickers:
