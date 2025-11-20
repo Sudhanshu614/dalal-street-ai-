@@ -56,12 +56,42 @@ class TickerResolver:
 
         # Cache active tickers for fast lookup
         self._active_tickers_cache = self._load_active_tickers()
+        # Index names cache and alias map
+        self._index_names = self._load_index_names()
+        self._index_alias_map = self._build_index_alias_map(self._index_names)
+        self._index_names = self._load_index_names()
+        self._normalized_index_map = {self._normalize_index_name(n): n for n in self._index_names}
 
     def _load_active_tickers(self) -> set:
         """Load set of currently active ticker symbols from stocks_master"""
         cursor = self.conn.cursor()
         cursor.execute("SELECT symbol FROM stocks_master WHERE is_active = 1")
         return {row['symbol'] for row in cursor.fetchall()}
+
+    def _load_index_names(self) -> List[str]:
+        try:
+            c = self.conn.cursor()
+            c.execute("SELECT DISTINCT index_name FROM market_indices")
+            rows = c.fetchall()
+            out = []
+            for r in rows:
+                v = r['index_name'] if isinstance(r, sqlite3.Row) else r[0]
+                if v:
+                    out.append(str(v).strip())
+            return out
+        except Exception:
+            return []
+
+    def _normalize_index_name(self, s: str) -> str:
+        x = str(s or '').upper()
+        x = re.sub(r"[^A-Z0-9]", "", x)
+        x = x.replace("NIFTYFIFTY", "NIFTY50")
+        x = x.replace("NIFTYONEHUNDRED", "NIFTY100")
+        x = x.replace("BANKNIFTY", "NIFTYBANK")
+        x = x.replace("NIFTYBANK", "NIFTYBANK")
+        if x == "NIFTY":
+            x = "NIFTY50"
+        return x
 
     def resolve(self, ticker: str) -> Dict[str, Any]:
         """
@@ -88,7 +118,8 @@ class TickerResolver:
                 'original_ticker': ticker,
                 'resolution_method': 'direct',
                 'confidence': 100,
-                'metadata': {'status': 'active', 'note': 'Ticker is currently active'}
+                'metadata': {'status': 'active', 'note': 'Ticker is currently active'},
+                'entity_type': 'stock'
             }
 
         try:
@@ -102,7 +133,8 @@ class TickerResolver:
                     'original_ticker': ticker,
                     'resolution_method': 'direct_lookup',
                     'confidence': 99,
-                    'metadata': {'status': 'active'}
+                    'metadata': {'status': 'active'},
+                    'entity_type': 'stock'
                 }
         except Exception:
             pass
@@ -121,10 +153,16 @@ class TickerResolver:
                         'original_ticker': ticker,
                         'resolution_method': 'symbol_fuzzy',
                         'confidence': conf,
-                        'metadata': {'matched_symbol': m, 'similarity_score': sim}
+                        'metadata': {'matched_symbol': m, 'similarity_score': sim},
+                        'entity_type': 'stock'
                     }
             except Exception:
                 pass
+
+        # Index resolution attempt
+        idx = self._resolve_index(ticker)
+        if idx:
+            return idx
 
         # Tier 2: Fuzzy name matching (company_name in stocks_master)
         fuzzy_result = self._resolve_via_fuzzy_matching(ticker)
@@ -174,7 +212,8 @@ class TickerResolver:
                             'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
                             'new_name': (disp_name or (row['new_name'] if isinstance(row, sqlite3.Row) else row[1])),
                             'reason': reason
-                        }
+                        },
+                        'entity_type': 'stock'
                     }
             cursor.execute("SELECT company_name FROM stocks_master WHERE symbol = ?", (ticker,))
             r = cursor.fetchone()
@@ -215,7 +254,8 @@ class TickerResolver:
                                 'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
                                 'new_name': (disp_name or (row['new_name'] if isinstance(row, sqlite3.Row) else row[1])),
                                 'reason': reason
-                            }
+                            },
+                            'entity_type': 'stock'
                         }
             tc = clean(ticker)
             cursor.execute(
@@ -240,7 +280,8 @@ class TickerResolver:
                         'metadata': {
                             'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
                             'new_name': row['new_name'] if isinstance(row, sqlite3.Row) else row[1]
-                        }
+                        },
+                        'entity_type': 'stock'
                     }
         except Exception:
             pass
@@ -268,8 +309,68 @@ class TickerResolver:
                 'suggestions': suggestions,
                 'last_seen': last_seen,
                 'note': f"Ticker '{ticker}' not found. Check suggestions or ticker may have changed."
-            }
+            },
+            'entity_type': 'unknown'
         }
+
+    def _resolve_index(self, text: str) -> Optional[Dict[str, Any]]:
+        q = str(text or '').strip()
+        if not q:
+            return None
+        q_upper = q.upper()
+        try:
+            for name in self._index_names:
+                if q_upper == str(name).upper():
+                    return {
+                        'resolved_ticker': None,
+                        'original_ticker': q,
+                        'resolution_method': 'index_direct',
+                        'confidence': 100,
+                        'metadata': {'index_name': name},
+                        'entity_type': 'index',
+                        'resolved_index_name': name
+                    }
+        except Exception:
+            pass
+        norm_q = self._normalize_index_name(q_upper)
+        try:
+            tgt = self._normalized_index_map.get(norm_q)
+            if tgt:
+                return {
+                    'resolved_ticker': None,
+                    'original_ticker': q,
+                    'resolution_method': 'index_normalized',
+                    'confidence': 95,
+                    'metadata': {'index_name': tgt},
+                    'entity_type': 'index',
+                    'resolved_index_name': tgt
+                }
+        except Exception:
+            pass
+        try:
+            matches = get_close_matches(q_upper, [str(n).upper() for n in self._index_names], n=1, cutoff=0.8)
+            if matches:
+                m = matches[0]
+                from difflib import SequenceMatcher
+                sim = SequenceMatcher(None, q_upper, m).ratio()
+                orig = None
+                for n in self._index_names:
+                    if str(n).upper() == m:
+                        orig = n
+                        break
+                if orig:
+                    return {
+                        'resolved_ticker': None,
+                        'original_ticker': q,
+                        'resolution_method': 'index_fuzzy',
+                        'confidence': int(sim*100),
+                        'metadata': {'index_name': orig, 'similarity_score': sim},
+                        'entity_type': 'index',
+                        'resolved_index_name': orig
+                    }
+        except Exception:
+            pass
+        return None
 
     def _resolve_via_demerger_correlation(self, ticker: str) -> Optional[Dict[str, Any]]:
         """
@@ -540,9 +641,116 @@ class TickerResolver:
         return None
 
     def refresh_cache(self):
-        """Refresh active tickers cache (call this after daily bhavcopy update)"""
         self._active_tickers_cache = self._load_active_tickers()
-        print(f"[INFO] Ticker resolver cache refreshed: {len(self._active_tickers_cache)} active tickers")
+        self._index_names = self._load_index_names()
+        self._index_alias_map = self._build_index_alias_map(self._index_names)
+        print(f"[INFO] Ticker resolver cache refreshed: {len(self._active_tickers_cache)} active tickers; {len(self._index_names)} indices")
+
+    def _load_index_names(self) -> List[str]:
+        try:
+            c = self.conn.cursor()
+            c.execute("SELECT DISTINCT index_name FROM market_indices")
+            rows = c.fetchall()
+            out = []
+            for row in rows:
+                nm = row['index_name'] if isinstance(row, sqlite3.Row) else row[0]
+                if nm:
+                    out.append(str(nm).strip())
+            return out
+        except Exception:
+            return []
+
+    def _normalize_index_key(self, s: str) -> str:
+        return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+    def _build_index_alias_map(self, names: List[str]) -> Dict[str, List[str]]:
+        m: Dict[str, List[str]] = {}
+        def _add(key: str, val: str):
+            if not key:
+                return
+            arr = m.get(key)
+            if arr is None:
+                m[key] = [val]
+            else:
+                if val not in arr:
+                    arr.append(val)
+        for name in names:
+            n = str(name or "").strip()
+            if not n:
+                continue
+            k = self._normalize_index_key(n)
+            _add(k, n)
+            u = n.upper()
+            _add(u.replace(" ", ""), n)
+            if u.startswith("NIFTY"):
+                parts = [p for p in u.split() if p]
+                if len(parts) >= 2:
+                    x = parts[1]
+                    alias = (x[:4] if len(x) >= 4 else x) + "NIFTY"
+                    _add(alias, n)
+                if len(parts) >= 3:
+                    x2 = parts[1]
+                    alias2 = (x2[:3] if len(x2) >= 3 else x2) + "NIFTY"
+                    _add(alias2, n)
+            if ("50" in u) and ("NIFTY" in u):
+                _add("NIFTY", n)
+        return m
+
+    def resolve_index(self, text: str) -> Optional[Dict[str, Any]]:
+        s = str(text or "").strip()
+        if not s:
+            return None
+        k = self._normalize_index_key(s)
+        cands = self._index_alias_map.get(k) or []
+        if cands:
+            q_tokens = [t for t in re.split(r"[^A-Z]+", k) if t]
+            def score(name: str) -> int:
+                u = self._normalize_index_key(name)
+                n_tokens = [t for t in re.split(r"[^A-Z]+", u) if t]
+                qs = set(q_tokens)
+                ns = [t for t in n_tokens if t not in ("NIFTY", "INDEX", "INDICES")]
+                match = 0
+                for qt in qs:
+                    for nt in ns:
+                        if nt == qt or (len(qt) >= 3 and nt.startswith(qt)):
+                            match += 1
+                            break
+                extra = max(len(ns) - match, 0)
+                return match * 2 - extra
+            best = sorted(cands, key=lambda nm: (score(nm), -len(nm)), reverse=True)[0]
+            return {
+                'resolved_index_name': best,
+                'original_ticker': text,
+                'resolution_method': 'index_alias',
+                'confidence': 95,
+                'metadata': {'type': 'index'}
+            }
+        from difflib import get_close_matches, SequenceMatcher
+        keys = list(self._index_alias_map.keys())
+        matches = get_close_matches(k, keys, n=1, cutoff=0.8)
+        if matches:
+            mk = matches[0]
+            cands2 = self._index_alias_map.get(mk) or []
+            name = cands2[0] if cands2 else None
+            sim = SequenceMatcher(None, k, mk).ratio()
+            if name:
+                return {
+                    'resolved_index_name': name,
+                    'original_ticker': text,
+                    'resolution_method': 'index_fuzzy',
+                    'confidence': int(sim * 100),
+                    'metadata': {'type': 'index'}
+                }
+        return None
+
+    def resolve_any(self, text: str) -> Dict[str, Any]:
+        r = self.resolve(text)
+        if r.get('resolved_ticker'):
+            return r
+        ir = self.resolve_index(text)
+        if ir:
+            return ir
+        return r
 
     def __del__(self):
         """Close database connection"""

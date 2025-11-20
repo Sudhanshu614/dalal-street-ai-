@@ -27,7 +27,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data_fetcher.universal_data_fetcher import UniversalDataFetcher
 from src.data_fetcher.bhavcopy_downloader import BhavcopyDownloader
-from src.data_fetcher.corporate_actions_ingester import CorporateActionsIngester
+try:
+    from src.data_fetcher.corporate_actions_ingester import CorporateActionsIngester
+except Exception:
+    CorporateActionsIngester = None
 from src.llm.function_declarations import FUNCTION_DECLARATIONS, SYSTEM_PROMPT
 from config import config
 import json
@@ -96,17 +99,17 @@ def execute_function_call(function_call):
             inp = params.get('input')
             if not isinstance(inp, str) or not inp.strip():
                 return {"error": "invalid_input"}
-            res = fetcher.ticker_resolver.resolve(inp.strip())
+            res = fetcher.ticker_resolver.resolve_any(inp.strip())
             return convert_proto_to_python(res)
         def _is_wildcard(sym: str) -> bool:
             return isinstance(sym, str) and ('%' in sym)
 
         def _resolve_ticker_or_error(input_symbol: str) -> Dict[str, Any]:
-            resolution = fetcher.ticker_resolver.resolve(input_symbol)
-            if not resolution.get('resolved_ticker'):
+            resolution = fetcher.ticker_resolver.resolve_any(input_symbol)
+            if not (resolution.get('resolved_ticker') or resolution.get('resolved_index_name')):
                 return {
                     'error': 'ticker_unresolved',
-                    'message': f"Ticker '{input_symbol}' could not be resolved to an active symbol.",
+                    'message': f"Ticker/Index '{input_symbol}' could not be resolved.",
                     'suggestions': resolution.get('metadata', {}).get('suggestions', []),
                     'last_seen': resolution.get('metadata', {}).get('last_seen'),
                     'resolution': resolution
@@ -161,21 +164,37 @@ def execute_function_call(function_call):
                         res = _resolve_ticker_or_error(sym_val.strip())
                         if res.get('error') == 'ticker_unresolved':
                             return res
-                        resolved = res['resolved_ticker']
-                        resolution_meta = {
-                            'original': sym_val,
-                            'resolved': resolved,
-                            'method': res['resolution_method'],
-                            'confidence': res['confidence'],
-                            'note': res.get('metadata', {}).get('note', '')
-                        }
-                        filters['symbol'] = resolved
-                        filters.pop('ticker', None)
+                        if res.get('resolved_index_name'):
+                            idx = res['resolved_index_name']
+                            resolution_meta = {
+                                'original': sym_val,
+                                'resolved': idx,
+                                'method': res['resolution_method'],
+                                'confidence': res['confidence'],
+                                'note': res.get('metadata', {}).get('note', '')
+                            }
+                            filters.pop('symbol', None)
+                            filters.pop('ticker', None)
+                            filters['index_name'] = idx
+                            pn['table'] = 'market_indices'
+                        else:
+                            resolved = res['resolved_ticker']
+                            resolution_meta = {
+                                'original': sym_val,
+                                'resolved': resolved,
+                                'method': res['resolution_method'],
+                                'confidence': res['confidence'],
+                                'note': res.get('metadata', {}).get('note', '')
+                            }
+                            filters['symbol'] = resolved
+                            filters.pop('ticker', None)
                         params['filters'] = filters
 
                 # List of symbols
                 elif isinstance(sym_val, list):
                     verified: List[str] = []
+                    verified_indices: List[str] = []
+                    verified_equities: List[str] = []
                     items_meta: List[Dict[str, Any]] = []
                     unresolved_items: List[Dict[str, Any]] = []
 
@@ -224,14 +243,28 @@ def execute_function_call(function_call):
                                     'note': 'Low confidence resolution omitted'
                                 })
                             else:
-                                verified.append(res['resolved_ticker'])
-                                items_meta.append({
-                                    'original': raw,
-                                    'resolved': res['resolved_ticker'],
-                                    'method': res['resolution_method'],
-                                    'confidence': res['confidence'],
-                                    'note': res.get('metadata', {}).get('note', '')
-                                })
+                                if res.get('resolved_index_name'):
+                                    idx = res['resolved_index_name']
+                                    verified.append(idx)
+                                    verified_indices.append(idx)
+                                    items_meta.append({
+                                        'original': raw,
+                                        'resolved': idx,
+                                        'method': res['resolution_method'],
+                                        'confidence': res['confidence'],
+                                        'note': res.get('metadata', {}).get('note', '')
+                                    })
+                                else:
+                                    sym = res['resolved_ticker']
+                                    verified.append(sym)
+                                    verified_equities.append(sym)
+                                    items_meta.append({
+                                        'original': raw,
+                                        'resolved': sym,
+                                        'method': res['resolution_method'],
+                                        'confidence': res['confidence'],
+                                        'note': res.get('metadata', {}).get('note', '')
+                                    })
 
                     if len([m for m in items_meta if m['resolved'] is not None]) == 0:
                         return {
@@ -241,13 +274,51 @@ def execute_function_call(function_call):
                             'suggestions': list({s for u in unresolved_items for s in (u.get('suggestions') or [])})[:10]
                         }
 
-                    # Replace filter values with verified list (dedup)
-                    filters['symbol'] = list(dict.fromkeys(verified))
-                    if 'ticker' in filters:
-                        filters.pop('ticker', None)
-                    if 'company_name' in filters:
-                        filters.pop('company_name', None)
-                    params['filters'] = filters
+                    # Mixed list handling: run separate queries for equities and indices, then merge
+                    verified_equities = list(dict.fromkeys(verified_equities))
+                    verified_indices = list(dict.fromkeys(verified_indices))
+                    combined_result = None
+                    if verified_indices:
+                        pn_idx = dict(pn)
+                        f_idx = dict(filters)
+                        f_idx.pop('symbol', None)
+                        f_idx.pop('ticker', None)
+                        f_idx['index_name'] = verified_indices
+                        pn_idx['filters'] = f_idx
+                        pn_idx['table'] = 'market_indices'
+                        idx_result = fetcher.query_stocks(**pn_idx)
+                    else:
+                        idx_result = None
+                    if verified_equities:
+                        pn_eq = dict(pn)
+                        f_eq = dict(filters)
+                        f_eq['symbol'] = verified_equities
+                        f_eq.pop('ticker', None)
+                        f_eq.pop('index_name', None)
+                        pn_eq['filters'] = f_eq
+                        eq_result = fetcher.query_stocks(**pn_eq)
+                    else:
+                        eq_result = None
+                    if idx_result is not None or eq_result is not None:
+                        r_eq = (eq_result or {}).get('results', []) if isinstance(eq_result, dict) else []
+                        r_idx = (idx_result or {}).get('results', []) if isinstance(idx_result, dict) else []
+                        combined = r_eq + r_idx
+                        combined_result = {
+                            'results': combined,
+                            'count': len(combined),
+                            'source': (eq_result or idx_result or {}).get('source', 'sqlite'),
+                            'table': 'mixed',
+                            'tags': ['mixed_equity_index'],
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        params['__combined_query_result'] = combined_result
+                    else:
+                        filters['symbol'] = verified_equities
+                        if 'ticker' in filters:
+                            filters.pop('ticker', None)
+                        if 'company_name' in filters:
+                            filters.pop('company_name', None)
+                        params['filters'] = filters
 
                     resolution_meta = {
                         'items': items_meta,
@@ -324,9 +395,87 @@ def execute_function_call(function_call):
             if isinstance(filters.get('symbol'), Iterable) and not isinstance(filters.get('symbol'), (list, tuple, str, bytes)):
                 filters['symbol'] = list(filters['symbol'])
             pn['filters'] = filters
-            result = fetcher.query_stocks(**pn)
+            cq = pn.pop('__combined_query_result', None)
+            if cq is not None:
+                result = cq
+            else:
+                result = fetcher.query_stocks(**pn)
         elif function_name == 'calculate_indicators':
             result = fetcher.calculate_indicators(**params)
+        elif function_name == 'get_option_chain':
+            tk = params.get('ticker') or params.get('symbol')
+            if not isinstance(tk, str) or not tk.strip():
+                return {"error": "invalid_input"}
+            res = _resolve_ticker_or_error(tk.strip())
+            if res.get('error') == 'ticker_unresolved':
+                return res
+            key = res.get('resolved_index_name') or res.get('resolved_ticker')
+            limit = params.get('limit') if isinstance(params.get('limit'), int) else None
+            atm_window = params.get('atm_window') if isinstance(params.get('atm_window'), int) else None
+            oc = fetcher.fetch('option_chain', {'symbol': key})
+            data = oc.get('data') if isinstance(oc, dict) else None
+            results = []
+            expiry_dates = []
+            underlying_value = None
+            if isinstance(data, dict):
+                rec = data.get('records') or data
+                expiry_dates = rec.get('expiryDates') or []
+                items = rec.get('data') or []
+                for it in items:
+                    sp = it.get('strikePrice')
+                    ed = it.get('expiryDate')
+                    ce = it.get('CE') or {}
+                    pe = it.get('PE') or {}
+                    uv = ce.get('underlyingValue') or pe.get('underlyingValue')
+                    if uv and not underlying_value:
+                        underlying_value = uv
+                    results.append({
+                        'strikePrice': sp,
+                        'expiryDate': ed,
+                        'CE': {
+                            'lastPrice': ce.get('lastPrice'),
+                            'openInterest': ce.get('openInterest'),
+                            'changeinOpenInterest': ce.get('changeinOpenInterest'),
+                            'impliedVolatility': ce.get('impliedVolatility')
+                        },
+                        'PE': {
+                            'lastPrice': pe.get('lastPrice'),
+                            'openInterest': pe.get('openInterest'),
+                            'changeinOpenInterest': pe.get('changeinOpenInterest'),
+                            'impliedVolatility': pe.get('impliedVolatility')
+                        }
+                    })
+            if isinstance(underlying_value, (int, float)) and results:
+                try:
+                    results = sorted(results, key=lambda r: abs(float(r.get('strikePrice') or 0) - float(underlying_value)))
+                    if isinstance(atm_window, int) and atm_window > 0:
+                        center = 0
+                        if results:
+                            center_item = results[0]
+                            center_strike = center_item.get('strikePrice') or 0
+                            around = [r for r in results if abs(float(r.get('strikePrice') or 0) - float(center_strike)) <= atm_window]
+                            results = around
+                except Exception:
+                    pass
+            if isinstance(limit, int) and limit > 0 and results:
+                results = results[:limit]
+            out = {
+                'results': results,
+                'count': len(results),
+                'source': (oc.get('metadata', {}).get('source') if isinstance(oc, dict) else 'unknown'),
+                'table': 'option_chain',
+                'tags': ['option_chain'],
+                'timestamp': datetime.now().isoformat(),
+                'expiryDates': expiry_dates,
+                'underlyingValue': underlying_value
+            }
+            result = out
+        elif function_name == 'fetch_any':
+            qt = params.get('query_type')
+            sub = params.get('params') if isinstance(params.get('params'), dict) else {}
+            if not isinstance(qt, str) or not qt.strip():
+                return {"error": "invalid_input"}
+            result = fetcher.fetch(qt.strip(), sub)
         elif function_name == 'query_corporate_actions':
             result = fetcher.query_corporate_actions(**params)
         elif function_name == 'fetch_stock_data':

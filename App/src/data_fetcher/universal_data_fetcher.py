@@ -21,6 +21,7 @@ import numpy as np
 from pathlib import Path
 import json
 import os
+import re
 
 # Import GenericQueryBuilder for zero-hardcoding SQL generation
 from .generic_query_builder import GenericQueryBuilder
@@ -305,7 +306,7 @@ class UniversalDataFetcher:
         return {
             'live_quote': {
                 'primary': 'jugaad',
-                'primary_timeout': 1000,  # ms
+                'primary_timeout': 1000,
                 'backup': 'nselib',
                 'backup_timeout': 3000,
                 'fallback': 'sqlite',
@@ -319,6 +320,13 @@ class UniversalDataFetcher:
                 'fallback': None,
                 'reason': 'Data exists locally, instant response'
             },
+            'index_ohlc': {
+                'primary': 'sqlite',
+                'primary_timeout': 100,
+                'backup': None,
+                'fallback': None,
+                'reason': 'Index data stored locally in market_indices'
+            },
             'corporate_actions': {
                 'primary': 'csv',
                 'primary_timeout': 100,
@@ -330,7 +338,7 @@ class UniversalDataFetcher:
             },
             'financial_results': {
                 'primary': 'nselib',
-                'primary_timeout': 30000,  # 30 seconds (very slow but unique)
+                'primary_timeout': 30000,
                 'backup': 'sqlite',
                 'backup_timeout': 100,
                 'fallback': None,
@@ -387,6 +395,13 @@ class UniversalDataFetcher:
             'historical_ohlc': {
                 'table': 'daily_ohlc',
                 'filter_param': 'symbol',
+                'sort_by': 'date',
+                'sort_order': 'desc',
+                'return_single': False
+            },
+            'index_ohlc': {
+                'table': 'market_indices',
+                'filter_param': 'index_name',
                 'sort_by': 'date',
                 'sort_order': 'desc',
                 'return_single': False
@@ -886,7 +901,22 @@ class UniversalDataFetcher:
                 return self.jugaad.stock_quote(symbol)
 
             elif query_type == 'option_chain':
-                return self.jugaad.index_option_chain(symbol)
+                is_equity = False
+                try:
+                    conn = sqlite3.connect(self.db_path)
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1 FROM stocks_master WHERE symbol = ? LIMIT 1", (str(symbol).upper(),))
+                    row = cur.fetchone()
+                    is_equity = bool(row)
+                    conn.close()
+                except Exception:
+                    is_equity = False
+                if is_equity:
+                    return self.jugaad.equities_option_chain(symbol)
+                else:
+                    sym2 = self._bridge_index_symbol_for_external(symbol)
+                    return self.jugaad.index_option_chain(sym2)
 
             elif query_type == 'market_status':
                 return self.jugaad.market_status()
@@ -926,11 +956,36 @@ class UniversalDataFetcher:
                 trade_date = params.get('date', datetime.now().strftime('%d-%m-%Y'))
                 return self.nselib_deriv.participant_wise_open_interest(trade_date)
 
+            elif query_type == 'option_chain':
+                sym2 = self._bridge_index_symbol_for_external(symbol)
+                return self.nselib_deriv.nse_live_option_chain(sym2)
+
             return None
 
         except Exception as e:
             # nselib method failed
             return None
+
+    def _bridge_index_symbol_for_external(self, index_name: str) -> str:
+        u = str(index_name or '').strip().upper()
+        if not u:
+            return u
+        tokens = [t for t in re.split(r"\s+", u) if t]
+        if not tokens:
+            return u
+        if tokens[0] != 'NIFTY':
+            return u.replace(' ', '')
+        rest = tokens[1:]
+        if any((t.isdigit() and t == '50') for t in rest):
+            return 'NIFTY'
+        second = rest[0] if rest else ''
+        if not second:
+            return 'NIFTY'
+        if len(second) <= 4:
+            alias = second + 'NIFTY'
+        else:
+            alias = second[:3] + 'NIFTY'
+        return alias
 
     def _determine_freshness(self, source_name: str) -> str:
         """

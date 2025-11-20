@@ -11,16 +11,34 @@ Philosophy: These 4 functions handle infinite query combinations (zero hardcodin
 FUNCTION_DECLARATIONS = [
     {
         "name": "resolve_ticker",
-        "description": "Resolve a user-provided ticker/company text to an active NSE symbol with confidence, suggestions, and last_seen.",
+        "description": "Resolve a user-provided stock or index text to a canonical key: equity symbol or index_name, with confidence, suggestions, and last_seen.",
         "parameters": {
             "type": "object",
             "properties": {
                 "input": {
                     "type": "string",
-                    "description": "Ticker or company text to resolve (wildcards like % allowed; wildcard is passthrough)."
+                    "description": "Ticker or index text to resolve (wildcards like % allowed; wildcard is passthrough)."
                 }
             },
             "required": ["input"]
+        }
+    },
+    {
+        "name": "fetch_any",
+        "description": "Generic fetch interface that exposes all query types discovered at runtime (e.g., option_chain, live_quote, market_status). Pass any params; system routes dynamically.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query_type": {
+                    "type": "string",
+                    "description": "Which query to run (e.g., 'option_chain', 'live_quote', 'market_status')."
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameters for the query (e.g., {'symbol':'TCS'})."
+                }
+            },
+            "required": ["query_type", "params"]
         }
     },
     {
@@ -123,6 +141,28 @@ FUNCTION_DECLARATIONS = [
                 "days": {
                     "type": "integer",
                     "description": "Number of days of historical data to use (default: 365)"
+                }
+            },
+            "required": ["ticker"]
+        }
+    },
+    {
+        "name": "get_option_chain",
+        "description": "Get option chain for a stock or index with CE/PE fields (strike, expiry, OI, change in OI, IV, lastPrice)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Stock ticker or index text"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max rows to return (optional)"
+                },
+                "atm_window": {
+                    "type": "integer",
+                    "description": "Number of strikes around ATM to include (optional)"
                 }
             },
             "required": ["ticker"]
