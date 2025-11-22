@@ -23,3 +23,16 @@ if [ "${FETCH_CFCA:-0}" = "1" ]; then
   fi
   ls -lh "$HOME"/data/CF-CA*.csv 2>/dev/null || true
 fi
+
+# Copy to repository path if it exists (for Docker volume mount)
+REPO_DB="$HOME/dalal-street-ai-/App/database/stock_market_new.db"
+if [ -d "$(dirname "$REPO_DB")" ]; then
+  cp -f "$DEST" "$REPO_DB"
+  echo "Updated repo database at $REPO_DB"
+fi
+
+REPO_DATA="$HOME/dalal-street-ai-/App/database"
+if [ "${FETCH_CFCA:-0}" = "1" ] && [ -d "$REPO_DATA" ]; then
+  cp -f "$HOME"/data/CF-CA*.csv "$REPO_DATA/"
+  echo "Updated repo CF-CA CSVs at $REPO_DATA"
+fi
