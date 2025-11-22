@@ -1353,44 +1353,44 @@ class UniversalDataFetcher:
                     print(f"[IND-ERR] func={spec['name']} error={type(e).__name__}: {str(e)}")
                     continue
 
-            # pandas-ta fallback for any spec that did not add columns
-            if PANDAS_TA_AVAILABLE:
-                dfp = df_prices.copy()
-                for spec in specs:
-                    added_cols = [c for c in df.columns if c.lower().startswith(spec['name'].lower())]
-                    if added_cols:
-                        continue
-                    fn = getattr(pta, spec['name'].lower(), None)
-                    if not callable(fn):
-                        continue
-                    try:
-                        import inspect
-                        sig = inspect.signature(fn)
-                        kwargs = {}
-                        for pname in sig.parameters.keys():
-                            pl = pname.lower()
-                            if pl in ('close','open','high','low','volume') and pl in dfp.columns:
-                                kwargs[pname] = dfp[pl]
-                        for k, v in (spec.get('params') or {}).items():
-                            if k in sig.parameters:
-                                kwargs[k] = v
-                        out = fn(**kwargs)
-                        added = []
-                        if isinstance(out, pd.DataFrame):
-                            for col in out.columns:
-                                df[f"{spec['name']}_{str(col)}"] = out[col].values
-                                added.append(f"{spec['name']}_{str(col)}")
-                        elif hasattr(out, 'values'):
-                            df[spec['name']] = getattr(out, 'values')
-                            added.append(spec['name'])
-                        elif isinstance(out, (list, tuple)):
-                            for i, series in enumerate(out):
-                                df[f"{spec['name']}__output_{i}"] = np.asarray(series)
-                                added.append(f"{spec['name']}__output_{i}")
-                        print(f"[IND-PTA] func={spec['name']} added={added}")
-                        all_added_cols.extend(added)
-                    except Exception as e:
-                        print(f"[IND-PTA-ERR] func={spec['name']} error={type(e).__name__}: {str(e)}")
+        # pandas-ta fallback for any spec that did not add columns
+        if PANDAS_TA_AVAILABLE:
+            dfp = df_prices.copy()
+            for spec in specs:
+                added_cols = [c for c in df.columns if c.lower().startswith(spec['name'].lower())]
+                if added_cols:
+                    continue
+                fn = getattr(pta, spec['name'].lower(), None)
+                if not callable(fn):
+                    continue
+                try:
+                    import inspect
+                    sig = inspect.signature(fn)
+                    kwargs = {}
+                    for pname in sig.parameters.keys():
+                        pl = pname.lower()
+                        if pl in ('close','open','high','low','volume') and pl in dfp.columns:
+                            kwargs[pname] = dfp[pl]
+                    for k, v in (spec.get('params') or {}).items():
+                        if k in sig.parameters:
+                            kwargs[k] = v
+                    out = fn(**kwargs)
+                    added = []
+                    if isinstance(out, pd.DataFrame):
+                        for col in out.columns:
+                            df[f"{spec['name']}_{str(col)}"] = out[col].values
+                            added.append(f"{spec['name']}_{str(col)}")
+                    elif hasattr(out, 'values'):
+                        df[spec['name']] = getattr(out, 'values')
+                        added.append(spec['name'])
+                    elif isinstance(out, (list, tuple)):
+                        for i, series in enumerate(out):
+                            df[f"{spec['name']}__output_{i}"] = np.asarray(series)
+                            added.append(f"{spec['name']}__output_{i}")
+                    print(f"[IND-PTA] func={spec['name']} added={added}")
+                    all_added_cols.extend(added)
+                except Exception as e:
+                    print(f"[IND-PTA-ERR] func={spec['name']} error={type(e).__name__}: {str(e)}")
 
             df = df.replace([np.inf, -np.inf], np.nan)
             if all_added_cols:
