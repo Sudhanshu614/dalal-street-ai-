@@ -2,23 +2,23 @@ version: '3.8'
 services:
   backend:
     build:
-      context: ./api
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: App/api/Dockerfile
     ports:
-      - "8000:8000"
+      - '8000:8000'
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - LLM_PROVIDER=${LLM_PROVIDER}
+      - GEMINI_API_KEY=
+      - GROQ_API_KEY=
+      - LLM_PROVIDER=
     volumes:
-      - ./Database:/app/Database:ro
+      - ./database:/app/Database:ro
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "8501:8501"
+      - '8501:8501'
     environment:
       - API_BASE_URL=http://backend:8000
     depends_on:
