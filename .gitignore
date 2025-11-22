@@ -5,20 +5,13 @@ App/.env
 App/api/.venv/
 logs/
 context.txt
-
-# IDE/Editor folders
-.trae/
-.vscode/
-.idea/
-
-# Testing
+App/database/*.db
+*.db
+App/scriptsrebuild/
 App/tests/
-
-# Deployment scripts (local use only)
 App/docker-compose.yml
 App/start_app.bat
-
-
+extra/
 # Google Cloud credentials
 gcp-service-account.json
 *.json
@@ -27,8 +20,14 @@ gcp-service-account.json
 # DATABASE FILES
 # ============================================
 
-# All database files excluded
-App/database/*.db
-*.db
+# Exclude LARGE production databases (1GB+)
 App/database/stock_market_new.db
 App/database/stock_market_backup_*.db
+App/database/stock_market_minimal.db
+*.db-wal
+*.db-shm
+App/database/backups/
+App/cache/
+cache/
+App/database/*.db-wal
+App/database/*.db-shm
