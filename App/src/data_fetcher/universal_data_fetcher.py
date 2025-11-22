@@ -477,7 +477,7 @@ class UniversalDataFetcher:
                     pass
 
                 if original_ticker != resolution['resolved_ticker']:
-                    print(f"[INFO] Ticker resolved: {original_ticker} → {resolution['resolved_ticker']}")
+                    print(f"[INFO] Ticker resolved: {original_ticker} -> {resolution['resolved_ticker']}")
 
         # Get routing strategy
         route = self._get_route(query_type, params, routing_strategy)
