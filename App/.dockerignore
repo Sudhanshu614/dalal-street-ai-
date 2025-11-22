@@ -1,0 +1,3 @@
+# Exclude the large SQLite database from Docker build
+database/stock_market_new.db
+database/CF-CA-*.csv
