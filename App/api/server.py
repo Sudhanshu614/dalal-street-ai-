@@ -133,7 +133,8 @@ def execute_function_call(function_call):
                         'last_seen': res.get('metadata', {}).get('last_seen'),
                         'resolution': res
                     }
-                resolved = res['resolved_ticker']
+                # Get resolved symbol from either resolved_ticker (stocks/ETFs) or resolved_index_name (indices)
+                resolved = res.get('resolved_ticker') or res.get('resolved_index_name')
                 resolution_meta = {
                     'original': symbol,
                     'resolved': resolved,
