@@ -18,8 +18,6 @@ App/tests/
 App/docker-compose.yml
 App/start_app.bat
 
-# Scripts (experimental/personal workflows)
-App/scriptsrebuild/
 
 # Google Cloud credentials
 gcp-service-account.json

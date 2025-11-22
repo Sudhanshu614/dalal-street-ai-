@@ -53,6 +53,11 @@ class TickerResolver:
                 self.cf_ca_data = pd.read_csv(csv_path)
             except Exception as e:
                 print(f"[WARN] Could not load CF-CA CSV: {e}")
+        # Load ETF symbols for detection
+        self._etf_symbols = self._load_etf_symbols()
+        # Build ETF normalization and alias maps (similar to indices)
+        self._normalized_etf_map = {self._normalize_etf_symbol(s): s for s in self._etf_symbols}
+        self._etf_alias_map = self._build_etf_alias_map(self._etf_symbols)
 
         # Cache active tickers for fast lookup
         self._active_tickers_cache = self._load_active_tickers()
@@ -67,6 +72,49 @@ class TickerResolver:
         cursor = self.conn.cursor()
         cursor.execute("SELECT symbol FROM stocks_master WHERE is_active = 1")
         return {row['symbol'] for row in cursor.fetchall()}
+
+    def _load_etf_symbols(self) -> set:
+        """
+        Load ETF symbols from database
+        
+        ETFs are stored in market_etfs table with a '-EQ' suffix (e.g., 'NIFTYBEES-EQ'),
+        but users query them without the suffix ('NIFTYBEES'). This method loads the
+        symbols and normalizes them to the user-facing format.
+        
+        Architecture Notes:
+        - market_etfs.index_name:  'NIFTYBEES-EQ' (with suffix)
+        - daily_ohlc.symbol:       'NIFTYBEES' (without suffix)
+        - User queries:            'NIFTYBEES' (without suffix)
+        - jugaad.stock_quote:      expects 'NIFTYBEES' (without suffix)
+        
+        Returns:
+            Set of ETF ticker symbols in user-facing format (e.g., 'NIFTYBEES')
+        """
+        cursor = self.conn.cursor()
+        try:
+            # Load all ETF symbols from market_etfs and strip the -EQ suffix
+            cursor.execute("SELECT DISTINCT index_name FROM market_etfs")
+            
+            etf_symbols = set()
+            for row in cursor.fetchall():
+                symbol_with_suffix = row['index_name'] or ''
+                # Remove -EQ suffix to get user-facing format
+                if symbol_with_suffix.endswith('-EQ'):
+                    base_symbol = symbol_with_suffix[:-3]  # Remove last 3 chars ('-EQ')
+                    if base_symbol:
+                        etf_symbols.add(base_symbol)
+            
+            # Validate we actually loaded ETFs
+            if not etf_symbols:
+                print("[WARN] TickerResolver: No ETF symbols loaded - check database schema")
+            else:
+                print(f"[INFO] TickerResolver: Loaded {len(etf_symbols)} ETF symbols")
+            
+            return etf_symbols
+            
+        except Exception as e:
+            print(f"[ERROR] TickerResolver: Failed to load ETF symbols: {e}")
+            return set()
 
     def _load_index_names(self) -> List[str]:
         try:
@@ -92,6 +140,57 @@ class TickerResolver:
         if x == "NIFTY":
             x = "NIFTY50"
         return x
+
+    def _normalize_etf_symbol(self, s: str) -> str:
+        """
+        Normalize ETF symbol for matching
+        
+        Handles common variations:
+        - Spaces and hyphens: 'NIFTY BEES' -> 'NIFTYBEES'
+        - Missing suffix 'S': 'NIFTYBEE' -> 'NIFTYBEES'
+        - Case variations
+        
+        Args:
+            s: ETF symbol to normalize
+            
+        Returns:
+            Normalized symbol
+        """
+        x = str(s or '').upper().strip()
+        # Remove all non-alphanumeric characters (spaces, hyphens, etc.)
+        x = re.sub(r"[^A-Z0-9]", "", x)
+        
+        # Common normalizations for ETF patterns
+        # Handle missing 'S' at end for BEES ETFs
+        if x.endswith('BEE') and not x.endswith('BEES'):
+            x = x + 'S'
+        
+        return x
+
+    def _build_etf_alias_map(self, etf_symbols: set) -> Dict[str, List[str]]:
+        """
+        Build alias map for ETFs
+        
+        Maps normalized forms to list of actual ETF symbols.
+        Handles common user query patterns.
+        
+        Args:
+            etf_symbols: Set of actual ETF symbols
+            
+        Returns:
+            Dict mapping normalized keys to lists of actual symbols
+        """
+        alias_map = {}
+        
+        for symbol in etf_symbols:
+            normalized = self._normalize_etf_symbol(symbol)
+            
+            if normalized not in alias_map:
+                alias_map[normalized] = []
+            
+            alias_map[normalized].append(symbol)
+        
+        return alias_map
 
     def resolve(self, ticker: str) -> Dict[str, Any]:
         """
@@ -121,6 +220,30 @@ class TickerResolver:
                 'metadata': {'status': 'active', 'note': 'Ticker is currently active'},
                 'entity_type': 'stock'
             }
+        # Tier 1b: Check if ticker is an ETF (direct match)
+        if ticker in getattr(self, '_etf_symbols', set()):
+            return {
+                'resolved_ticker': ticker,
+                'original_ticker': ticker,
+                'resolution_method': 'etf_direct',
+                'confidence': 100,
+                'metadata': {'status': 'active', 'note': 'ETF ticker'},
+                'entity_type': 'etf'
+            }
+        
+        # Tier 1c: Check if ticker is an ETF (normalized match)
+        # Handles: 'NIFTY BEES' -> 'NIFTYBEES', 'NIFTYBEE' -> 'NIFTYBEES'
+        normalized_ticker = self._normalize_etf_symbol(ticker)
+        if normalized_ticker in getattr(self, '_normalized_etf_map', {}):
+            actual_symbol = self._normalized_etf_map[normalized_ticker]
+            return {
+                'resolved_ticker': actual_symbol,
+                'original_ticker': ticker,
+                'resolution_method': 'etf_normalized',
+                'confidence': 98,
+                'metadata': {'normalized_from': ticker, 'note': 'ETF symbol normalized'},
+                'entity_type': 'etf'
+            }
 
         try:
             cursor = self.conn.cursor()
@@ -139,7 +262,9 @@ class TickerResolver:
         except Exception:
             pass
 
+        # Fuzzy matching for stocks and ETFs
         if '%' not in ticker and '*' not in ticker:
+            # Try stock symbol fuzzy match
             try:
                 active = list(self._active_tickers_cache)
                 matches = get_close_matches(ticker, active, n=1, cutoff=0.86)
@@ -156,6 +281,27 @@ class TickerResolver:
                         'metadata': {'matched_symbol': m, 'similarity_score': sim},
                         'entity_type': 'stock'
                     }
+            except Exception:
+                pass
+            
+            # Try ETF symbol fuzzy match
+            try:
+                etf_symbols_list = list(getattr(self, '_etf_symbols', set()))
+                if etf_symbols_list:
+                    etf_matches = get_close_matches(ticker, etf_symbols_list, n=1, cutoff=0.86)
+                    if etf_matches:
+                        matched_etf = etf_matches[0]
+                        from difflib import SequenceMatcher
+                        sim = SequenceMatcher(None, ticker, matched_etf).ratio()
+                        conf = int(sim*100)
+                        return {
+                            'resolved_ticker': matched_etf,
+                            'original_ticker': ticker,
+                            'resolution_method': 'etf_fuzzy',
+                            'confidence': conf,
+                            'metadata': {'matched_symbol': matched_etf, 'similarity_score': sim},
+                            'entity_type': 'etf'
+                        }
             except Exception:
                 pass
 
@@ -307,11 +453,12 @@ class TickerResolver:
             'confidence': 0,
             'metadata': {
                 'suggestions': suggestions,
-                'last_seen': last_seen,
-                'note': f"Ticker '{ticker}' not found. Check suggestions or ticker may have changed."
+                'last_seen': last_seen
             },
             'entity_type': 'unknown'
         }
+
+
 
     def _resolve_index(self, text: str) -> Optional[Dict[str, Any]]:
         q = str(text or '').strip()
@@ -723,7 +870,8 @@ class TickerResolver:
                 'original_ticker': text,
                 'resolution_method': 'index_alias',
                 'confidence': 95,
-                'metadata': {'type': 'index'}
+                'metadata': {'type': 'index'},
+                'entity_type': 'index'
             }
         from difflib import get_close_matches, SequenceMatcher
         keys = list(self._index_alias_map.keys())
@@ -739,7 +887,8 @@ class TickerResolver:
                     'original_ticker': text,
                     'resolution_method': 'index_fuzzy',
                     'confidence': int(sim * 100),
-                    'metadata': {'type': 'index'}
+                    'metadata': {'type': 'index'},
+                    'entity_type': 'index'
                 }
         return None
 

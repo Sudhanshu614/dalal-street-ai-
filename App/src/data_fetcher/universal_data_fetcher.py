@@ -898,7 +898,16 @@ class UniversalDataFetcher:
 
         try:
             if query_type == 'live_quote':
-                return self.jugaad.stock_quote(symbol)
+                # Dynamic routing based on entity_type from TickerResolver
+                resolution = self.ticker_resolver.resolve_any(symbol)
+                entity_type = resolution.get('entity_type') if isinstance(resolution, dict) else None
+                
+                if entity_type == 'index':
+                    # Use live_index for indices
+                    return self.jugaad.live_index(symbol)
+                else:
+                    # Use stock_quote for stocks and ETFs (both work with stock_quote)
+                    return self.jugaad.stock_quote(symbol)
 
             elif query_type == 'option_chain':
                 is_equity = False

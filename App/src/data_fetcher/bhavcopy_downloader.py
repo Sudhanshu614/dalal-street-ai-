@@ -38,6 +38,118 @@ except ImportError:
     print("[WARN] nselib not available for bhavcopy download")
 
 
+class BhavcopyColumnMapper:
+    """
+    Maps various bhavcopy column name formats to standardized names
+    Handles NSE, jugaad-data, and nselib format variations
+    """
+    
+    COLUMN_ALIASES = {
+        'symbol': ['SYMBOL', 'Symbol', 'STOCK', 'SCRIP'],
+        'date': ['DATE1', 'DATE', 'TradeDate', 'TRADE_DATE', 'TIMESTAMP'],
+        'open': ['OPEN_PRICE', 'OPEN', 'OpenPrice', 'Open'],
+        'high': ['HIGH_PRICE', 'HIGH', 'HighPrice', 'High'],
+        'low': ['LOW_PRICE', 'LOW', 'LowPrice', 'Low'],
+        'close': ['CLOSE_PRICE', 'CLOSE', 'ClosePrice', 'Close', 'LAST_PRICE'],
+        'volume': ['TTL_TRD_QNTY', 'TOTTRDQTY', 'Volume', 'VOLUME', 'TotalTradedQuantity'],
+        'prev_close': ['PREV_CLOSE', 'PREVCLOSE', 'PrevClose', 'Previous Close'],
+        'series': ['SERIES', 'Series', 'SEGMENT']
+    }
+    
+    @classmethod
+    def detect_columns(cls, df: pd.DataFrame) -> dict:
+        """
+        Auto-detect column mappings from DataFrame
+        
+        Returns:
+            dict: {standardized_name: actual_column_name}
+        """
+        mapping = {}
+        available_cols = set(df.columns)
+        
+        for standard_name, aliases in cls.COLUMN_ALIASES.items():
+            for alias in aliases:
+                if alias in available_cols:
+                    mapping[standard_name] = alias
+                    break
+        
+        return mapping
+    
+    @classmethod
+    def validate_required_columns(cls, mapping: dict) -> Tuple[bool, str]:
+        """
+        Check if all required OHLC columns are present
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        required = ['symbol', 'open', 'high', 'low', 'close']
+        missing = [col for col in required if col not in mapping]
+        
+        if missing:
+            return False, f"Missing required columns: {', '.join(missing)}"
+        
+        return True, ""
+
+
+class OHLCValidator:
+    """
+    Validates OHLC data integrity before database insertion
+    """
+    
+    @staticmethod
+    def validate_row(row: dict) -> Tuple[bool, str]:
+        """
+        Validate a single OHLC row
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        symbol = row.get('symbol')
+        
+        # Check required fields
+        if not symbol:
+            return False, "Missing symbol"
+        
+        open_price = row.get('open')
+        high = row.get('high')
+        low = row.get('low')
+        close = row.get('close')
+        
+        # Check for nulls
+        if any(x is None for x in [open_price, high, low, close]):
+            return False, f"{symbol}: Missing OHLC values"
+        
+        # Convert to float and validate
+        try:
+            o, h, l, c = float(open_price), float(high), float(low), float(close)
+        except (ValueError, TypeError):
+            return False, f"{symbol}: Invalid number format"
+        
+        # Price sanity checks
+        if any(x <= 0 for x in [o, h, l, c]):
+            return False, f"{symbol}: Non-positive prices not allowed"
+        
+        if h < l:
+            return False, f"{symbol}: High ({h}) < Low ({l})"
+        
+        if not (l <= o <= h and l <= c <= h):
+            # Allow small floating point errors
+            if not (l <= o + 0.05 and o <= h + 0.05 and l <= c + 0.05 and c <= h + 0.05):
+                return False, f"{symbol}: Open/Close outside High/Low range"
+        
+        # Volume check (allow 0 for illiquid stocks)
+        volume = row.get('volume', 0)
+        try:
+            volume = int(volume)
+            if volume < 0:
+                return False, f"{symbol}: Negative volume"
+        except (ValueError, TypeError):
+            return False, f"{symbol}: Invalid volume format"
+        
+        return True, ""
+
+
 class BhavcopyDownloader:
     """
     Download and process daily NSE bhavcopy (equity market data)
@@ -369,6 +481,9 @@ class BhavcopyDownloader:
         cache_file = self.cache_dir / f"bhavcopy_{date.strftime('%Y%m%d')}.csv"
         equity_df.to_csv(cache_file, index=False)
 
+        # Load OHLC data into daily_ohlc table
+        ohlc_stats = self.load_bhavcopy_to_ohlc(df, date)
+
         # Write unified update log
         try:
             cursor.execute(
@@ -398,6 +513,9 @@ class BhavcopyDownloader:
             'detected_ipos': detected_ipos,  # Auto-detected IPO listings
             'data_source': data_source,
             'cache_file': str(cache_file),
+            'ohlc_inserted': ohlc_stats['inserted'],
+            'ohlc_skipped': ohlc_stats['skipped'],
+            'ohlc_failed': ohlc_stats['failed'],
             'reactivated': to_reactivate if 'to_reactivate' in locals() else [],
             'isin_updates': isin_update_samples,
             'unresolved_disappeared': unresolved_old[:20],
@@ -735,19 +853,52 @@ class BhavcopyDownloader:
             proc_date = date
             if proc_date is None:
                 proc_date = datetime.now()
+            
+            # Check if already processed
+            check = self.check_date_already_loaded(proc_date)
+            if check['exists']:
+                print(f"\n[INFO] OHLC data already loaded for {proc_date.strftime('%Y-%m-%d')}")
+                print(f"       Records: {check['record_count']}")
+                print(f"       Loaded at: {check['loaded_at']}")
+                print(f"       Sample: {', '.join(check['symbols_sample'])}")
+                print(f"\n       Use force=True to reload (via backfill), or skip to avoid duplicates.")
+                return {
+                    'date': proc_date.strftime('%Y-%m-%d'),
+                    'status': 'already_loaded',
+                    'ohlc_records': check['record_count']
+                }
+
             df = None
             data_source = None
             try:
                 df, data_source = self.download_bhavcopy(proc_date)
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Failed to download for {proc_date.strftime('%Y-%m-%d')}: {e}")
+                print(f"[INFO] Trying previous trading days...")
+                
                 for i in range(1, 8):
                     try_date = proc_date - timedelta(days=i)
+                    print(f"  Attempting {try_date.strftime('%Y-%m-%d')} (T-{i})...")
+                    
+                    # Check if fallback date already processed
+                    check = self.check_date_already_loaded(try_date)
+                    if check['exists']:
+                        print(f"  ✓ Data for {try_date.strftime('%Y-%m-%d')} already exists. Stopping fallback.")
+                        return {
+                            'date': try_date.strftime('%Y-%m-%d'),
+                            'status': 'already_loaded',
+                            'ohlc_records': check['record_count']
+                        }
+
                     try:
                         df, data_source = self.download_bhavcopy(try_date)
                         proc_date = try_date
+                        print(f"  ✓ Found data for {try_date.strftime('%Y-%m-%d')}")
                         break
-                    except Exception:
+                    except Exception as err:
+                        print(f"  ✗ Failed: {err}")
                         continue
+            
             if df is None or data_source is None or len(df) == 0:
                 raise Exception('no_data_after_backoff')
 
@@ -759,6 +910,7 @@ class BhavcopyDownloader:
             print(f"  Total active tickers: {result['total_tickers']}")
             print(f"  New tickers: {len(result['new_tickers'])}")
             print(f"  Disappeared tickers: {len(result['disappeared_tickers'])}")
+            print(f"  OHLC records inserted: {result['ohlc_inserted']}")
             print(f"  Ticker changes detected: {len(result['ticker_changes'])}")
             print(f"  IPO listings detected: {len(result['detected_ipos'])}")
             print(f"  Data source: {result['data_source']}")
@@ -807,8 +959,290 @@ class BhavcopyDownloader:
             return {
                 'date': date.strftime('%Y-%m-%d'),
                 'error': error_msg,
-                'status': 'failed'
+                'status': 'failed',
+                'reason': 'Data not available yet or download failed.',
+                'next_action': 'Retry after market close (6:00 PM IST) or specify a past date manually'
             }
+
+
+    def load_bhavcopy_to_ohlc(
+        self, 
+        df: pd.DataFrame, 
+        date: datetime,
+        batch_size: int = 500,
+        validate: bool = True
+    ) -> Dict:
+        """
+        Load bhavcopy OHLC data into daily_ohlc table with validation and bulk insert
+        
+        Args:
+            df: Bhavcopy DataFrame
+            date: Date of the bhavcopy
+            batch_size: Number of records per batch (default: 500)
+            validate: Whether to validate data (default: True)
+            
+        Returns:
+            dict: Statistics of the operation
+        """
+        # Auto-detect column mapping
+        col_mapping = BhavcopyColumnMapper.detect_columns(df)
+        is_valid, error = BhavcopyColumnMapper.validate_required_columns(col_mapping)
+        
+        if not is_valid:
+            print(f"[ERROR] Invalid bhavcopy format: {error}")
+            return {'inserted': 0, 'skipped': 0, 'failed': 0}
+        
+        print(f"[INFO] Detected columns: {col_mapping}")
+        
+        # Filter to equity series
+        if 'series' in col_mapping:
+            series_col = col_mapping['series']
+            equity_df = df[df[series_col] == 'EQ'].copy()
+        else:
+            equity_df = df.copy()
+            print(f"[WARN] No series column found, processing all rows as equity")
+        
+        print(f"[INFO] Processing {len(equity_df)} equity stocks for {date.strftime('%Y-%m-%d')}")
+        
+        # Prepare standardized data
+        records_to_insert = []
+        stats = {
+            'total': len(equity_df),
+            'inserted': 0,
+            'skipped': 0,
+            'failed': 0,
+            'validation_errors': [],
+            'duplicate_symbols': []
+        }
+        
+        for idx, row in equity_df.iterrows():
+            # Map to standardized format
+            try:
+                standardized = {
+                    'symbol': row[col_mapping['symbol']],
+                    'date': date.strftime('%Y-%m-%d'),
+                    'open': row[col_mapping['open']],
+                    'high': row[col_mapping['high']],
+                    'low': row[col_mapping['low']],
+                    'close': row[col_mapping['close']],
+                    'volume': row.get(col_mapping.get('volume'), 0),
+                    'prev_close': row.get(col_mapping.get('prev_close')),
+                    'data_source': 'bhavcopy'
+                }
+                
+                # Validate if enabled
+                if validate:
+                    is_valid, error = OHLCValidator.validate_row(standardized)
+                    if not is_valid:
+                        stats['failed'] += 1
+                        stats['validation_errors'].append({
+                            'symbol': standardized['symbol'],
+                            'error': error
+                        })
+                        continue
+                
+                records_to_insert.append(standardized)
+            except Exception as e:
+                stats['failed'] += 1
+                continue
+        
+        # Bulk insert with batching
+        cursor = self.conn.cursor()
+        
+        for i in range(0, len(records_to_insert), batch_size):
+            batch = records_to_insert[i:i + batch_size]
+            
+            for record in batch:
+                try:
+                    cursor.execute('''
+                        INSERT INTO daily_ohlc
+                        (symbol, date, open, high, low, close, volume, prev_close, data_source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        record['symbol'],
+                        record['date'],
+                        record['open'],
+                        record['high'],
+                        record['low'],
+                        record['close'],
+                        record['volume'],
+                        record['prev_close'],
+                        record['data_source']
+                    ))
+                    stats['inserted'] += 1
+                    
+                except sqlite3.IntegrityError:
+                    # Duplicate (symbol, date) - expected for reruns
+                    stats['skipped'] += 1
+                    stats['duplicate_symbols'].append(record['symbol'])
+                
+                except Exception as e:
+                    stats['failed'] += 1
+                    stats['validation_errors'].append({
+                        'symbol': record['symbol'],
+                        'error': str(e)
+                    })
+            
+            # Commit batch
+            self.conn.commit()
+            
+            # Progress feedback
+            progress = min(i + batch_size, len(records_to_insert))
+            if progress % 1000 == 0 or progress == len(records_to_insert):
+                print(f"[PROGRESS] {progress}/{len(records_to_insert)} records processed "
+                      f"(Inserted: {stats['inserted']}, Skipped: {stats['skipped']}, Failed: {stats['failed']})")
+        
+        # Summary
+        print(f"\n[SUMMARY] OHLC Load Complete")
+        print(f"  ✓ Inserted: {stats['inserted']} new records")
+        if stats['skipped'] > 0:
+            print(f"  ⊘ Skipped: {stats['skipped']} duplicates")
+        if stats['failed'] > 0:
+            print(f"  ✗ Failed: {stats['failed']} validation errors")
+            if len(stats['validation_errors']) <= 5:
+                print(f"  Errors:")
+                for err in stats['validation_errors']:
+                    print(f"    - {err['symbol']}: {err['error']}")
+        
+        return stats
+
+    def check_date_already_loaded(self, date: datetime) -> Dict:
+        """
+        Check if OHLC data for a date is already loaded
+        
+        Returns:
+            dict: Status of data for the date
+        """
+        cursor = self.conn.cursor()
+        date_str = date.strftime('%Y-%m-%d')
+        
+        # Check daily_ohlc
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM daily_ohlc WHERE date = ?",
+                (date_str,)
+            )
+            result = cursor.fetchone()
+            ohlc_count = result['cnt'] if result else 0
+        except Exception:
+            ohlc_count = 0
+        
+        # Check bhavcopy_history
+        try:
+            cursor.execute(
+                "SELECT download_timestamp FROM bhavcopy_history WHERE date = ?",
+                (date_str,)
+            )
+            history = cursor.fetchone()
+            loaded_at = history['download_timestamp'] if history else None
+        except Exception:
+            loaded_at = None
+        
+        # Get sample symbols
+        symbols_sample = []
+        if ohlc_count > 0:
+            try:
+                cursor.execute(
+                    "SELECT symbol FROM daily_ohlc WHERE date = ? LIMIT 5",
+                    (date_str,)
+                )
+                symbols_sample = [row['symbol'] for row in cursor.fetchall()]
+            except Exception:
+                pass
+        
+        return {
+            'exists': ohlc_count > 0,
+            'record_count': ohlc_count,
+            'symbols_sample': symbols_sample,
+            'loaded_at': loaded_at
+        }
+
+    def backfill_date_range(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        force: bool = False,
+        skip_weekends: bool = True
+    ) -> Dict:
+        """
+        Backfill OHLC data for a date range
+        
+        Args:
+            start_date: Start date (inclusive)
+            end_date: End date (inclusive)
+            force: If True, reprocess even if data exists
+            skip_weekends: If True, skip Saturdays and Sundays
+            
+        Returns:
+            dict: Summary of backfill operation
+        """
+        print(f"\n{'='*70}")
+        print(f"BACKFILL: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        print(f"{'='*70}\n")
+        
+        current_date = start_date
+        results = []
+        
+        while current_date <= end_date:
+            # Skip weekends (market closed)
+            if skip_weekends and current_date.weekday() >= 5:
+                print(f"[SKIP] {current_date.strftime('%Y-%m-%d')} is a weekend")
+                current_date += timedelta(days=1)
+                continue
+            
+            # Check if already exists
+            check = self.check_date_already_loaded(current_date)
+            
+            if check['exists'] and not force:
+                print(f"[EXISTS] {current_date.strftime('%Y-%m-%d')} already loaded "
+                      f"({check['record_count']} records at {check['loaded_at']})")
+                results.append({
+                    'date': current_date.strftime('%Y-%m-%d'),
+                    'status': 'skipped',
+                    'reason': 'already_exists'
+                })
+                current_date += timedelta(days=1)
+                continue
+            
+            # Process this date
+            try:
+                result = self.update_daily(current_date)
+                results.append({
+                    'date': current_date.strftime('%Y-%m-%d'),
+                    'status': 'success',
+                    'ohlc_records': result.get('ohlc_inserted', 0)
+                })
+            except Exception as e:
+                print(f"[ERROR] {current_date.strftime('%Y-%m-%d')}: {e}")
+                results.append({
+                    'date': current_date.strftime('%Y-%m-%d'),
+                    'status': 'failed',
+                    'error': str(e)
+                })
+            
+            current_date += timedelta(days=1)
+            time.sleep(1)  # Rate limiting
+        
+        # Summary
+        print(f"\n{'='*70}")
+        print(f"BACKFILL COMPLETE")
+        print(f"{'='*70}")
+        
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        skipped_count = sum(1 for r in results if r['status'] == 'skipped')
+        failed_count = sum(1 for r in results if r['status'] == 'failed')
+        
+        print(f"  ✓ Success: {success_count}")
+        print(f"  ⊘ Skipped: {skipped_count}")
+        print(f"  ✗ Failed: {failed_count}")
+        
+        return {
+            'total_dates': len(results),
+            'success': success_count,
+            'skipped': skipped_count,
+            'failed': failed_count,
+            'details': results
+        }
 
     def get_history(self, days: int = 30) -> pd.DataFrame:
         """Get bhavcopy history for last N days"""

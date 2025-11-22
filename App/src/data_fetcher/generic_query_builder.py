@@ -158,8 +158,14 @@ class GenericQueryBuilder:
 
             else:
                 # Exact match
-                where_clauses.append(f"{field} = ?")
-                params.append(condition)
+                # Use case-insensitive comparison for index_name field
+                # This fixes the issue where 'NIFTY 50' and 'Nifty 50' are stored separately
+                if field == 'index_name' and table == 'market_indices':
+                    where_clauses.append(f"UPPER({field}) = UPPER(?)")
+                    params.append(condition)
+                else:
+                    where_clauses.append(f"{field} = ?")
+                    params.append(condition)
 
         if where_clauses:
             where_str = f"WHERE {' AND '.join(where_clauses)}"
