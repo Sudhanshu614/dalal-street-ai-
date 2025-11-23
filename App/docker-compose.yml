@@ -11,7 +11,7 @@ services:
       - GROQ_API_KEY=
       - LLM_PROVIDER=
     volumes:
-      - ./database:/app/Database:ro
+      - ./database:/app/database:ro
 
   frontend:
     build:
