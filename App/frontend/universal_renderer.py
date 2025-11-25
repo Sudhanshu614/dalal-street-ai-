@@ -30,7 +30,10 @@ def _sanitize_text(text: str) -> str:
         pass
     lines = t.split('\n')
     out = []
+    # Improved header regex to catch all markdown heading patterns
     header_re = re.compile(r'^\s*#{1,6}\s+')
+    # Also catch headings that might have special chars or emojis after the #
+    aggressive_header_re = re.compile(r'^\s*#{1,6}[\s\u200b]*')
     html_head_re = re.compile(r'<\s*h[1-6][^>]*>([\s\S]*?)<\s*/\s*h[1-6]\s*>', re.IGNORECASE)
     html_wrap_re = re.compile(r'<\s*(span|div|p)[^>]*>([\s\S]*?)<\s*/\s*\1\s*>', re.IGNORECASE)
     in_key_insights = False
@@ -46,8 +49,11 @@ def _sanitize_text(text: str) -> str:
         if '\t' in s:
             # Drop tab-separated lines from narrative; tables are rendered separately
             continue
-        if header_re.match(s):
-            s = header_re.sub('', s).strip()
+        # AGGRESSIVE heading removal - strip ALL markdown heading syntax
+        if header_re.match(s) or aggressive_header_re.match(s):
+            # Remove heading markers
+            s = aggressive_header_re.sub('', s).strip()
+            # If nothing left after removing headers, skip this line
             if not s:
                 continue
         if '<' in s and '>' in s:
@@ -74,6 +80,13 @@ def _sanitize_text(text: str) -> str:
                 return _natural_label(tok)
             return tok
         s = re.sub(r"\b[A-Za-z0-9_]{3,}\b", repl_ident, s)
+        
+        # SAFETY CHECK: Ensure no heading markers remain after all processing
+        # This catches any edge cases that slipped through
+        if re.search(r'^\s*#{1,6}[\s\u200b]*', s):
+            # Still has heading markers - strip them again
+            s = re.sub(r'^\s*#{1,6}[\s\u200b]*', '', s).strip()
+        
         # Emoji-start lines → force a separate line (no bullets)
         if re.match(r"^(📌|🔍|📊|📈|📝|📎|📋|📍|📣)\s*", s):
             out.append(s)
