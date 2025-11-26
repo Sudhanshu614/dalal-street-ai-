@@ -21,6 +21,7 @@ import numpy as np
 from pathlib import Path
 import json
 import os
+import tempfile
 import re
 
 # Import GenericQueryBuilder for zero-hardcoding SQL generation
@@ -135,6 +136,8 @@ class UniversalDataFetcher:
             self.cache_ttl_sec = getattr(app_config, 'PRICE_CACHE_TTL_SEC', 60)
         except Exception:
             self.cache_ttl_sec = int(os.getenv('PRICE_CACHE_TTL_SEC', '60'))
+
+        self._ind_debug_path = os.path.join(tempfile.gettempdir(), 'indicator_debug.log')
 
         print(f"[OK] UniversalDataFetcher initialized")
         print(f"   - SQLite: {len(self.schemas['sqlite'])} tables discovered")
@@ -328,13 +331,13 @@ class UniversalDataFetcher:
                 'reason': 'Index data stored locally in market_indices'
             },
             'corporate_actions': {
-                'primary': 'csv',
+                'primary': 'sqlite',
                 'primary_timeout': 100,
-                'backup': 'sqlite',
+                'backup': 'csv',
                 'backup_timeout': 100,
                 'fallback': 'jugaad',
                 'fallback_timeout': 500,
-                'reason': 'CSV most complete + fresh for historical actions'
+                'reason': 'Authoritative DB ingestion preferred; CSV as backup'
             },
             'financial_results': {
                 'primary': 'nselib',
@@ -412,7 +415,7 @@ class UniversalDataFetcher:
                 'return_single': True
             },
             'corporate_actions': {
-                'table': 'corporate_actions',
+                'table': 'corporate_events',
                 'filter_param': 'symbol',
                 'sort_by': 'ex_date',
                 'sort_order': 'desc',
@@ -452,32 +455,33 @@ class UniversalDataFetcher:
         """
         start_time = time.time()
 
-        # Resolve ticker if 'symbol' in params (auto-handle ticker changes)
+        # Resolve ticker if 'symbol' in params (auto-handle ticker/indices)
         ticker_resolution = None
         if params and 'symbol' in params and isinstance(params['symbol'], str):
             resolution = self.ticker_resolver.resolve(params['symbol'])
+            resolved_symbol = resolution.get('resolved_ticker') or resolution.get('resolved_index_name')
 
-            if resolution['resolved_ticker']:
+            if resolved_symbol:
                 original_ticker = params['symbol']
-                params['symbol'] = resolution['resolved_ticker']
+                params['symbol'] = resolved_symbol
 
                 ticker_resolution = {
                     'original': original_ticker,
-                    'resolved': resolution['resolved_ticker'],
-                    'method': resolution['resolution_method'],
-                    'confidence': resolution['confidence'],
-                    'note': resolution['metadata'].get('note', '')
+                    'resolved': resolved_symbol,
+                    'method': resolution.get('resolution_method'),
+                    'confidence': resolution.get('confidence'),
+                    'note': (resolution.get('metadata') or {}).get('note', '')
                 }
 
                 # Symbol bridge: keep both original and resolved for SQLite queries
                 try:
-                    if isinstance(original_ticker, str) and original_ticker.upper() != resolution['resolved_ticker'].upper():
-                        params['_symbol_bridge'] = [resolution['resolved_ticker'], original_ticker.upper()]
+                    if isinstance(original_ticker, str) and original_ticker.upper() != resolved_symbol.upper():
+                        params['_symbol_bridge'] = [resolved_symbol, original_ticker.upper()]
                 except Exception:
                     pass
 
-                if original_ticker != resolution['resolved_ticker']:
-                    print(f"[INFO] Ticker resolved: {original_ticker} -> {resolution['resolved_ticker']}")
+                if original_ticker != resolved_symbol:
+                    print(f"[INFO] Ticker resolved: {original_ticker} -> {resolved_symbol}")
 
         # Get routing strategy
         route = self._get_route(query_type, params, routing_strategy)
@@ -1239,6 +1243,22 @@ class UniversalDataFetcher:
         OPERATION 2: Calculate technical indicators
         """
         symbol = ticker
+        ticker_resolution = None
+        try:
+            _res = self.ticker_resolver.resolve(symbol)
+            _resolved = _res.get('resolved_ticker') or _res.get('resolved_index_name') or symbol
+            if isinstance(_resolved, str):
+                if _resolved != symbol:
+                    print(f"[INFO] Ticker resolved: {symbol} -> {_resolved}")
+                symbol = _resolved
+                ticker_resolution = {
+                    'original': ticker,
+                    'resolved': _resolved,
+                    'method': _res.get('resolution_method'),
+                    'confidence': _res.get('confidence')
+                }
+        except Exception:
+            pass
         specs: List[Dict[str, Any]] = []
         for item in indicators or []:
             if isinstance(item, dict) and 'name' in item:
@@ -1270,8 +1290,15 @@ class UniversalDataFetcher:
         if isinstance(days, int) and days > 0:
             required_rows = max(required_rows, days)
 
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[IND-DEBUG] symbol={symbol}, days={days}, required_rows={required_rows}, required_inputs={required_inputs}\n")
         df_prices, source_used = self._fetch_prices_series(symbol, required_rows, required_inputs)
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[IND-DEBUG] Fetch complete: source={source_used}, rows={len(df_prices) if df_prices is not None else 0}\n")
+        
         if df_prices is None or df_prices.empty or (len(df_prices) < required_rows):
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[IND-DEBUG] REJECTED: df_none={df_prices is None}, df_empty={df_prices.empty if df_prices is not None else 'N/A'}, len={len(df_prices) if df_prices is not None else 0} < required={required_rows}\n")
             return {
                 'results': [],
                 'count': 0,
@@ -1318,29 +1345,92 @@ class UniversalDataFetcher:
                     if isinstance(out, dict):
                         for k, v in out.items():
                             col = k if k else output_names[0]
-                            df[col] = v
+                            arr = np.asarray(v)
+                            if arr.ndim > 1:
+                                arr = arr.reshape(-1)
+                            m = arr.shape[0]
+                            n = len(df)
+                            if m != n:
+                                if m > n:
+                                    arr = arr[m-n:]
+                                else:
+                                    _pad = np.empty(n, dtype=object)
+                                    _pad[:] = None
+                                    if m > 0:
+                                        _pad[n-m:] = arr
+                                    arr = _pad
+                            df[col] = arr
                             added.append(col)
                     elif isinstance(out, pd.DataFrame):
                         for i, col in enumerate(out.columns):
                             name = output_names[i] if i < len(output_names) and output_names[i] else f"{spec['name']}_{i}"
-                            df[name] = out.iloc[:, i].values
+                            arr = np.asarray(out.iloc[:, i].values)
+                            m = arr.shape[0]
+                            n = len(df)
+                            if m != n:
+                                if m > n:
+                                    arr = arr[m-n:]
+                                else:
+                                    _pad = np.empty(n, dtype=object)
+                                    _pad[:] = None
+                                    if m > 0:
+                                        _pad[n-m:] = arr
+                                    arr = _pad
+                            df[name] = arr
                             added.append(name)
                     elif isinstance(out, (np.ndarray, list)):
                         if isinstance(out, list) and len(out) > 1 and all(hasattr(x, '__len__') for x in out):
                             cols_to_use = output_names if len(output_names) >= len(out) else [f"{spec['name']}__output_{i}" for i in range(len(out))]
                             for i, series in enumerate(out):
-                                df[cols_to_use[i]] = np.asarray(series)
+                                arr = np.asarray(series)
+                                if arr.ndim > 1:
+                                    arr = arr.reshape(-1)
+                                m = arr.shape[0]
+                                n = len(df)
+                                if m != n:
+                                    if m > n:
+                                        arr = arr[m-n:]
+                                    else:
+                                        _pad = np.empty(n, dtype=object)
+                                        _pad[:] = None
+                                        if m > 0:
+                                            _pad[n-m:] = arr
+                                        arr = _pad
+                                df[cols_to_use[i]] = arr
                                 added.append(cols_to_use[i])
                         else:
                             arr = np.asarray(out)
                             if arr.ndim == 1:
                                 name = output_names[0] if output_names else spec['name']
+                                m = arr.shape[0]
+                                n = len(df)
+                                if m != n:
+                                    if m > n:
+                                        arr = arr[m-n:]
+                                    else:
+                                        _pad = np.empty(n, dtype=object)
+                                        _pad[:] = None
+                                        if m > 0:
+                                            _pad[n-m:] = arr
+                                        arr = _pad
                                 df[name] = arr
                                 added.append(name)
                             elif arr.ndim == 2:
                                 cols_to_use = output_names if len(output_names) >= arr.shape[1] else [f"{spec['name']}__output_{i}" for i in range(arr.shape[1])]
                                 for i in range(arr.shape[1]):
-                                    df[cols_to_use[i]] = arr[:, i]
+                                    colarr = arr[:, i]
+                                    m = colarr.shape[0]
+                                    n = len(df)
+                                    if m != n:
+                                        if m > n:
+                                            colarr = colarr[m-n:]
+                                        else:
+                                            _pad = np.empty(n, dtype=object)
+                                            _pad[:] = None
+                                            if m > 0:
+                                                _pad[n-m:] = colarr
+                                            colarr = _pad
+                                    df[cols_to_use[i]] = colarr
                                     added.append(cols_to_use[i])
                     else:
                         # Fallback: single series
@@ -1376,16 +1466,52 @@ class UniversalDataFetcher:
                             kwargs[k] = v
                     out = fn(**kwargs)
                     added = []
+                    n = len(df)
                     if isinstance(out, pd.DataFrame):
                         for col in out.columns:
-                            df[f"{spec['name']}_{str(col)}"] = out[col].values
+                            arr = np.asarray(out[col].values)
+                            m = arr.shape[0]
+                            if m != n:
+                                if m > n:
+                                    arr = arr[m-n:]
+                                else:
+                                    _pad = np.empty(n, dtype=object)
+                                    _pad[:] = None
+                                    if m > 0:
+                                        _pad[n-m:] = arr
+                                    arr = _pad
+                            df[f"{spec['name']}_{str(col)}"] = arr
                             added.append(f"{spec['name']}_{str(col)}")
                     elif hasattr(out, 'values'):
-                        df[spec['name']] = getattr(out, 'values')
+                        arr = np.asarray(getattr(out, 'values'))
+                        m = arr.shape[0]
+                        if m != n:
+                            if m > n:
+                                arr = arr[m-n:]
+                            else:
+                                _pad = np.empty(n, dtype=object)
+                                _pad[:] = None
+                                if m > 0:
+                                    _pad[n-m:] = arr
+                                arr = _pad
+                        df[spec['name']] = arr
                         added.append(spec['name'])
                     elif isinstance(out, (list, tuple)):
                         for i, series in enumerate(out):
-                            df[f"{spec['name']}__output_{i}"] = np.asarray(series)
+                            arr = np.asarray(series)
+                            if arr.ndim > 1:
+                                arr = arr.reshape(-1)
+                            m = arr.shape[0]
+                            if m != n:
+                                if m > n:
+                                    arr = arr[m-n:]
+                                else:
+                                    _pad = np.empty(n, dtype=object)
+                                    _pad[:] = None
+                                    if m > 0:
+                                        _pad[n-m:] = arr
+                                    arr = _pad
+                            df[f"{spec['name']}__output_{i}"] = arr
                             added.append(f"{spec['name']}__output_{i}")
                     print(f"[IND-PTA] func={spec['name']} added={added}")
                     all_added_cols.extend(added)
@@ -1394,7 +1520,8 @@ class UniversalDataFetcher:
 
             df = df.replace([np.inf, -np.inf], np.nan)
             if all_added_cols:
-                df[all_added_cols] = df[all_added_cols].where(pd.notna(df[all_added_cols]), None)
+                for c in set(all_added_cols):
+                    df[c] = df[c].where(pd.notna(df[c]), None)
             records = df.to_dict('records')
             latency_ms = int((time.time() - calc_start) * 1000)
             print(f"[IND] source={source_used} rows={len(df)} latency_ms={latency_ms}")
@@ -1403,46 +1530,95 @@ class UniversalDataFetcher:
                 'count': len(records),
                 'source': source_used or ('sqlite' if df_prices is not None else 'unknown'),
                 'table': 'daily_ohlc',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'ticker_resolution': ticker_resolution
             }
 
     def _fetch_prices_series(self, symbol: str, days: int, required_inputs: Optional[List[str]] = None) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[FETCH-START] symbol={symbol}, days={days}, required_inputs={required_inputs}\n")
         df = None
         src = None
         required_inputs = required_inputs or []
         cache_key = (tuple(symbol) if isinstance(symbol, (list, tuple)) else symbol, int(days), tuple(sorted(required_inputs)))
         cached = self._price_cache.get(cache_key)
         if cached:
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-CACHE] HIT - returning cached data\n")
             dfc, ts = cached
             if (time.time() - ts) <= self.cache_ttl_sec:
                 return dfc.copy(), 'cache'
-        # If only 'close' is required and jugaad is available, use fast chart_data
-        if self.jugaad and set(required_inputs).issubset({'close'}):
+
+        # STRATEGY: Check Local DB -> nselib (recent) -> jugaad (history)
+
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[FETCH-SQLITE] Attempting SQLite query...\n")
+        try:
+            is_index = False
             try:
-                payload = self.jugaad.chart_data(symbol, days)
-                # Normalize known structure: grapthData with date/value
-                records = None
-                if isinstance(payload, dict):
-                    records = payload.get('grapthData') or payload.get('graphData') or payload.get('data')
-                if isinstance(records, list) and records:
-                    rows = []
-                    for item in records[:days]:
-                        dt = item.get('date') or item.get('Date') or item.get('dt')
-                        val = item.get('value') or item.get('Value') or item.get('close')
-                        if dt is not None and val is not None:
-                            rows.append({'date': dt, 'close': val})
-                    if rows:
-                        df = pd.DataFrame(rows)
-                        src = 'jugaad'
+                ri = self.ticker_resolver.resolve_index(symbol)
+                if isinstance(ri, dict) and (ri.get('resolved_index_name') or ri.get('entity_type') == 'index'):
+                    is_index = True
+                    symbol_index = ri.get('resolved_index_name') or symbol
+                else:
+                    symbol_index = symbol
             except Exception:
-                pass
+                symbol_index = symbol
+                is_index = False
+            if is_index:
+                filters = {'index_name': symbol_index if not isinstance(symbol_index, (list, tuple)) else list(symbol_index)}
+                fields = ['date', 'open', 'high', 'low', 'close', 'volume', 'index_name']
+                sql, sql_params = self.query_builder.query(
+                    table='market_indices',
+                    filters=filters,
+                    fields=fields,
+                    sort_by='date',
+                    sort_order='desc',
+                    limit=days
+                )
+            else:
+                filters = {'symbol': symbol if not isinstance(symbol, (list, tuple)) else list(symbol)}
+                fields = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+                sql, sql_params = self.query_builder.query(
+                    table='daily_ohlc',
+                    filters=filters,
+                    fields=fields,
+                    sort_by='date',
+                    sort_order='desc',
+                    limit=days
+                )
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-SQLITE] SQL: {sql[:100]}... params: {sql_params}\n")
+            conn = sqlite3.connect(self.db_path)
+            df = pd.read_sql_query(sql, conn, params=sql_params)
+            conn.close()
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-SQLITE] Query complete: rows={len(df) if df is not None else 0}\n")
+            if df is not None and not df.empty:
+                if len(df) >= days:
+                    src = 'sqlite'
+                    with open(self._ind_debug_path, 'a') as f:
+                        f.write(f"[FETCH-SQLITE] SUCCESS - sufficient rows ({len(df)} >= {days})\n")
+                else:
+                    src = 'sqlite'
+                    with open(self._ind_debug_path, 'a') as f:
+                        f.write(f"[FETCH-SQLITE] PARTIAL - insufficient rows ({len(df)} < {days})\n")
+        except Exception as e:
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-SQLITE] ERROR: {type(e).__name__}: {str(e)}\n")
+            df = None
+            src = None
+
+        # 2. If DB failed or empty, try nselib for recent data (<= 5 days)
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[FETCH-NSELIB] Check: df_none={df is None}, df_empty={df.empty if df is not None else 'N/A'}, has_nselib={self.nselib_cm is not None}, days={days}\n")
         if (df is None or df.empty) and self.nselib_cm and days <= 5:
-            # Attempt explicit date handling for recent days to prioritize nselib
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-NSELIB] Attempting nselib...\n")
             try:
                 def _date_str(dt: datetime) -> str:
                     return dt.strftime('%d-%m-%Y')
 
-                # Limit per-day API calls for performance
                 max_days = min(max(days, 1), 5)
                 rows = []
                 seen_dates = set()
@@ -1469,7 +1645,6 @@ class UniversalDataFetcher:
                     if df0 is None or df0.empty:
                         continue
                     cols = list(df0.columns)
-                    # Map columns using documented schema
                     scol = next((c for c in cols if str(c).lower() in ('symbol','tckrsymb','securityname')), None)
                     dcol = next((c for c in cols if str(c).lower() in ('date','date1','traddt','lasttradgdt')), None)
                     ocol = next((c for c in cols if str(c).lower() in ('open','open_price','opnpric')), None)
@@ -1483,9 +1658,7 @@ class UniversalDataFetcher:
                     dff = df0.loc[sym_mask].copy()
                     if dff.empty:
                         continue
-                    # Use provided date column if available; fallback to requested dstr
                     dvals = dff[dcol].astype(str) if dcol in dff.columns else pd.Series([dstr]*len(dff))
-                    # Normalize one row per date for the symbol
                     for idx, row in dff.iterrows():
                         date_val = str(row.get(dcol, dstr))
                         if date_val in seen_dates:
@@ -1500,37 +1673,45 @@ class UniversalDataFetcher:
                         if vcol and vcol in dff.columns: rec['volume'] = row.get(vcol)
                         rows.append(rec)
                         seen_dates.add(date_val)
-                    if len(rows) >= days:
-                        break
-                if rows:
-                    df = pd.DataFrame(rows)
-                    src = 'nselib'
+                        if len(rows) >= days:
+                            break
+                    if rows:
+                        df = pd.DataFrame(rows)
+                        src = 'nselib'
             except Exception:
                 pass
-        if df is None or df.empty:
+
+        # 3. If still empty and only 'close' is needed, try jugaad (last resort)
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[FETCH-JUGAAD] Check: df_none={df is None}, df_empty={df.empty if df is not None else 'N/A'}, has_jugaad={self.jugaad is not None}, inputs_match={set(required_inputs).issubset({'close'})}\n")
+        if (df is None or df.empty) and self.jugaad and set(required_inputs).issubset({'close'}):
+            with open(self._ind_debug_path, 'a') as f:
+                f.write(f"[FETCH-JUGAAD] WARNING: Attempting jugaad (this may hang)...\n")
             try:
-                filters = {'symbol': symbol if not isinstance(symbol, (list, tuple)) else list(symbol)}
-                sql, sql_params = self.query_builder.query(
-                    table='daily_ohlc',
-                    filters=filters,
-                    fields=['date', 'open', 'high', 'low', 'close', 'volume', 'symbol'],
-                    sort_by='date',
-                    sort_order='desc',
-                    limit=days
-                )
-                conn = sqlite3.connect(self.db_path)
-                df = pd.read_sql_query(sql, conn, params=sql_params)
-                conn.close()
-                src = 'sqlite'
+                payload = self.jugaad.chart_data(symbol, days)
+                records = None
+                if isinstance(payload, dict):
+                    records = payload.get('grapthData') or payload.get('graphData') or payload.get('data')
+                if isinstance(records, list) and records:
+                    rows = []
+                    for item in records[:days]:
+                        dt = item.get('date') or item.get('Date') or item.get('dt')
+                        val = item.get('value') or item.get('Value') or item.get('close')
+                        if dt is not None and val is not None:
+                            rows.append({'date': dt, 'close': val})
+                    if rows:
+                        df = pd.DataFrame(rows)
+                        src = 'jugaad'
             except Exception:
-                df = None
-                src = None
+                pass
+
         if df is not None and not df.empty:
             df = df.sort_values('date')
-        if df is not None and not df.empty:
             self._price_cache[cache_key] = (df.copy(), time.time())
+        
+        with open(self._ind_debug_path, 'a') as f:
+            f.write(f"[FETCH-RETURN] source={src}, rows={len(df) if df is not None else 0}\n")
         return df, src
-
     def _compute_required_rows(self, specs: List[Dict[str, Any]]) -> int:
         min_rows = 0
         for spec in specs:

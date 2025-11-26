@@ -162,19 +162,23 @@ class BhavcopyDownloader:
     - Trigger ticker resolution for disappeared tickers
     """
 
-    def __init__(self, db_path: str, cache_dir: str = "cache/bhavcopy", enable_ipo_detection: bool = False, enable_demerger_correlation: bool = True):
+    def __init__(self, db_path: str, cache_dir: str = "cache/bhavcopy", enable_ipo_detection: bool = False, enable_demerger_correlation: bool = True, enable_ticker_tracking: bool = True):
         """
         Initialize bhavcopy downloader
 
         Args:
             db_path: Path to SQLite database
             cache_dir: Directory to cache bhavcopy files
+            enable_ipo_detection: Enable IPO detection
+            enable_demerger_correlation: Enable demerger correlation
+            enable_ticker_tracking: Enable tracking of new/disappeared tickers and updating stocks_master
         """
         self.db_path = Path(db_path)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.enable_ipo_detection = enable_ipo_detection
         self.enable_demerger_correlation = enable_demerger_correlation
+        self.enable_ticker_tracking = enable_ticker_tracking
 
         # Initialize database connection
         self.conn = sqlite3.connect(str(self.db_path))
@@ -346,6 +350,23 @@ class BhavcopyDownloader:
 
         current_tickers = set(equity_df['SYMBOL'].unique())
 
+        # Load OHLC data into database (always done)
+        ohlc_stats = self.load_bhavcopy_to_ohlc(df, date)
+
+        # Skip tracking if disabled (pure OHLC scrape mode)
+        if not self.enable_ticker_tracking:
+            return {
+                'total_tickers': len(current_tickers),
+                'new_tickers': set(),
+                'disappeared_tickers': set(),
+                'ticker_changes': [],
+                'detected_ipos': [],
+                'ohlc_inserted': ohlc_stats['inserted'],
+                'ohlc_skipped': ohlc_stats['skipped'],
+                'ohlc_failed': ohlc_stats['failed'],
+                'data_source': data_source
+            }
+
         # Reactivate any symbols present today
         try:
             cursor = self.conn.cursor()
@@ -481,8 +502,8 @@ class BhavcopyDownloader:
         cache_file = self.cache_dir / f"bhavcopy_{date.strftime('%Y%m%d')}.csv"
         equity_df.to_csv(cache_file, index=False)
 
-        # Load OHLC data into daily_ohlc table
-        ohlc_stats = self.load_bhavcopy_to_ohlc(df, date)
+        # OHLC data already loaded at start of function
+
 
         # Write unified update log
         try:
@@ -593,7 +614,7 @@ class BhavcopyDownloader:
                             'reason': 'isin_match',
                             'confidence': 95
                         })
-                        self._store_ticker_mapping(old_ticker, new_ticker, new_ticker, date, 'isin_match', 95)
+                        # self._store_ticker_mapping(old_ticker, new_ticker, new_ticker, date, 'isin_match', 95)
                         print(f"[AUTO-DETECT] Ticker change: {old_ticker} → {new_ticker} (isin_match)")
 
             csv_files = sorted(list(self.db_path.parent.glob('CF-CA-*.csv')))
@@ -627,7 +648,7 @@ class BhavcopyDownloader:
                                     'confidence': 90,
                                     'company_name': company_name
                                 })
-                                self._store_ticker_mapping(old_ticker, new_symbol, company_name, date, 'cf_ca_window', 90)
+                                # self._store_ticker_mapping(old_ticker, new_symbol, company_name, date, 'cf_ca_window', 90)
                                 print(f"[AUTO-DETECT] Ticker change: {old_ticker} → {new_symbol} (cf_ca_window)")
 
             cursor.execute("SELECT old_name,new_name,nse_symbol,change_date,confidence FROM stock_aliases")
@@ -661,7 +682,7 @@ class BhavcopyDownloader:
                                     'reason': 'alias_recent',
                                     'confidence': 85
                                 })
-                                self._store_ticker_mapping(old_ticker, new_ticker, new_name, date, 'alias_recent', 85)
+                                # self._store_ticker_mapping(old_ticker, new_ticker, new_name, date, 'alias_recent', 85)
                                 print(f"[AUTO-DETECT] Ticker change: {old_ticker} → {new_ticker} (alias_recent)")
 
         except Exception as e:
@@ -994,15 +1015,15 @@ class BhavcopyDownloader:
         
         print(f"[INFO] Detected columns: {col_mapping}")
         
-        # Filter to equity series
+        # Filter to equity and book entry series
         if 'series' in col_mapping:
             series_col = col_mapping['series']
-            equity_df = df[df[series_col] == 'EQ'].copy()
+            equity_df = df[df[series_col].isin(['EQ', 'BE'])].copy()
         else:
             equity_df = df.copy()
             print(f"[WARN] No series column found, processing all rows as equity")
         
-        print(f"[INFO] Processing {len(equity_df)} equity stocks for {date.strftime('%Y-%m-%d')}")
+        print(f"[INFO] Processing {len(equity_df)} stocks (EQ + BE series) for {date.strftime('%Y-%m-%d')}")
         
         # Prepare standardized data
         records_to_insert = []
@@ -1203,6 +1224,13 @@ class BhavcopyDownloader:
                 })
                 current_date += timedelta(days=1)
                 continue
+            
+            # If force mode and data exists, delete it first
+            if force and check['exists']:
+                print(f"[FORCE] Deleting {check['record_count']} existing records for {current_date.strftime('%Y-%m-%d')}")
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM daily_ohlc WHERE date = ?", (current_date.strftime('%Y-%m-%d'),))
+                self.conn.commit()
             
             # Process this date
             try:

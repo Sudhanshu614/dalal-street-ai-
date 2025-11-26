@@ -7,14 +7,12 @@ logs/
 context.txt
 App/database/*.db
 *.db
-App/scriptsrebuild/
 App/tests/
 App/docker-compose.yml
 App/start_app.bat
 extra/
 # Google Cloud credentials
 gcp-service-account.json
-*.json
 
 # ============================================
 # DATABASE FILES
@@ -31,3 +29,82 @@ App/cache/
 cache/
 App/database/*.db-wal
 App/database/*.db-shm
+
+# ============================================
+# NEW DIRECTORIES (User Specified)
+# ============================================
+App/src/lifecycle/
+App/scriptsrebuild/
+App/scripts/
+Scripts/
+.trae/
+App/utils/
+App/src/utils/
+
+# ============================================
+# CSV DATA FILES
+# ============================================
+App/database/namechange.csv
+App/database/symbolchange.csv
+App/database/IPO-PastIssue-*.csv
+App/database/CF-CA-*.csv
+App/database/Company_Name_Changes_NSE.xlsx
+
+# ============================================
+# BACKFILL SCRIPTS (Root level App/)
+# ============================================
+App/BACKFILL_*.py
+App/STEP*.py
+App/DAILY_RUNNER.py
+App/backfill_*.py
+App/check_*.py
+App/test_*.py
+
+# ============================================
+# DEBUG & TEST FILES (Root Level)
+# ============================================
+# Debug scripts
+debug_*.py
+simple_debug.py
+quick_test.py
+probe_*.py
+diagnose_*.py
+investigate_*.py
+save_*.py
+
+# Test scripts (root level)
+test_*.py
+verify_*.py
+stress_test_*.py
+demo_*.py
+
+# Analysis scripts
+analyze_*.py
+check_*.py
+comprehensive_*.py
+
+# Output files
+*.txt
+!requirements.txt
+*.json
+!package.json
+!tsconfig.json
+*.log
+demerger_new_listing_correlations.csv
+similarity_analysis.json
+
+# Markdown debugging docs
+Debugging*.md
+Refining*.md
+
+# Local scripts
+start_backend.ps1
+complete_database_update.ps1
+download_database.sh
+upload_database_to_cloud.ps1
+
+# Database files
+company_lifecycle.db
+
+# API test scripts
+App/api/test_*.py

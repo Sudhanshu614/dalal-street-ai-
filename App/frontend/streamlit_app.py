@@ -243,7 +243,7 @@ def show_initial_ui():
         options=SUGGESTIONS.keys(),
         key="selected_suggestion",
     )
-    st.caption("Dalal Street AI is for analysis only, not investment advice.")    
+    st.caption("Dalal Street AI is for analysis only, not investment advice. 💙 Built with love to join the INDmoney team as a PM intern, inspired by their amazing mind AI!")    
     st.markdown("</div>", unsafe_allow_html=True)
 
 def show_disclaimer_dialog():

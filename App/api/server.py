@@ -795,11 +795,11 @@ async def chat(request: ChatRequest):
             print(f"\n[CHAT] User Query: [Contains Unicode characters]")
 
         response = chat.send_message(request.query)
-
-        # Initialize response data
         llm_response_text = ""
         raw_results = None
         function_called = None
+        # Initialize response data
+        
 
         # Senior Dev: Multi-turn function calling support
         # Gemini might return multiple function calls in sequence
@@ -1152,7 +1152,8 @@ if __name__ == "__main__":
 
 # Configure structured logging to file and console
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-logs_dir = os.path.join(project_root, 'logs')
+repo_root = os.path.dirname(project_root)
+logs_dir = os.path.join(repo_root, 'logs')
 os.makedirs(logs_dir, exist_ok=True)
 
 logger = logging.getLogger("backend")

@@ -192,10 +192,178 @@ class TickerResolver:
         
         return alias_map
 
+    def _normalize_company_name(self, name):
+        if not name:
+            return ""
+        
+        name = name.upper().strip()
+        name = name.replace('&', ' AND ')
+        name = re.sub(r"[\.,\-/()'\"]+", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        
+        # Common suffixes to remove (in order of specificity)
+        suffixes = [
+            ' LIMITED',
+            ' LTD.',
+            ' LTD',
+            ' PRIVATE LIMITED',
+            ' PVT. LTD.',
+            ' PVT LTD',
+            ' PVT.',
+            ' PVT',
+            ' CORPORATION',
+            ' CORP.',
+            ' CORP',
+            ' INCORPORATED',
+            ' INC.',
+            ' INC',
+            ' COMPANY',
+            ' CO.',
+            ' CO',
+        ]
+        
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)].strip()
+                break
+        
+        return name
+
+    def _normalize_tokens(self, text: str) -> List[str]:
+        s = self._normalize_company_name(text)
+        toks = [t for t in re.split(r"\s+", s) if t]
+        stop = {
+            'LIMITED','LTD','PRIVATE','PVT','COMPANY','CO','IND','INDUSTRIES','BANK','PLC'
+        }
+        out = []
+        for t in toks:
+            u = t.strip()
+            if not u:
+                continue
+            if u in stop:
+                continue
+            if len(u) == 1:
+                continue
+            out.append(u)
+        return out
+
+    def _token_similarity(self, a: List[str], b: List[str]) -> float:
+        if not a or not b:
+            return 0.0
+        aset = set(a)
+        bset = set(b)
+        match = 0
+        for qt in aset:
+            if qt in bset:
+                match += 1
+                continue
+            for nt in bset:
+                if len(qt) >= 3 and nt.startswith(qt):
+                    match += 1
+                    break
+        return (match * 2) / (len(aset) + len(bset))
+
+    def _fuzzy_match_active(self, query):
+        """
+        Fuzzy match query against active ticker symbols and company names.
+        Uses suffix normalization for better matching (e.g., "TATA MOTORS" matches "TATA MOTORS LIMITED").
+        
+        Args:
+            query: Search string (already uppercased)
+            
+        Returns:
+            dict with {symbol, name, confidence} if match found, else None
+        """
+        import difflib
+        
+        query_upper = query.upper()
+        
+        # Normalize query for comparison
+        query_normalized = self._normalize_company_name(query_upper)
+        
+        # First try exact symbol match
+        if query_upper in self._active_tickers_cache:
+            # Query DB to get company name
+            cur = self.conn.cursor()
+            cur.execute("SELECT company_name FROM stocks_master WHERE symbol = ?", (query_upper,))
+            result = cur.fetchone()
+            company_name = result['company_name'] if result else query_upper
+            
+            return {
+                'symbol': query_upper,
+                'name': company_name,
+                'confidence': 100
+            }
+        
+        # Try fuzzy symbol match
+        symbols = list(self._active_tickers_cache)
+        close_symbols = difflib.get_close_matches(query_upper, symbols, n=1, cutoff=0.85)
+        if close_symbols:
+            best_symbol = close_symbols[0]
+            confidence = difflib.SequenceMatcher(None, query_upper, best_symbol).ratio() * 100
+            
+            # Get company name
+            cur = self.conn.cursor()
+            cur.execute("SELECT company_name FROM stocks_master WHERE symbol = ?", (best_symbol,))
+            result = cur.fetchone()
+            company_name = result['company_name'] if result else best_symbol
+            
+            return {
+                'symbol': best_symbol,
+                'name': company_name,
+                'confidence': min(int(confidence), 99)  # Cap at 99 for fuzzy matches
+            }
+        
+        # Try fuzzy company name match with token-based normalization
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT symbol, company_name 
+            FROM stocks_master 
+            WHERE is_active = 1
+        """)
+        
+        matches = []
+        for row in cur.fetchall():
+            name_upper = row['company_name'].upper() if row['company_name'] else ''
+            if name_upper:
+                q_tokens = self._normalize_tokens(query_upper)
+                n_tokens = self._normalize_tokens(name_upper)
+                similarity = self._token_similarity(q_tokens, n_tokens)
+                if similarity >= 0.85:
+                    matches.append((name_upper, row['symbol'], similarity))
+        
+        if matches:
+            # Sort by similarity score (highest first), then by name length (shorter first for tie-breaking)
+            # This ensures "TATA MOTORS LIMITED" (shorter, exact match) beats 
+            # "TATA MOTORS PASSENGER VEHICLES LIMITED" (longer, less exact)
+            matches.sort(key=lambda x: (-x[2], len(x[0])))
+            
+            best_match = matches[0]
+            best_name = best_match[0]
+            best_symbol = best_match[1]
+            confidence = best_match[2] * 100
+            
+            return {
+                'symbol': best_symbol,
+                'name': best_name,
+                'confidence': min(int(confidence), 98)  # Cap at 98 for name matches
+            }
+        
+        return None
+
     def resolve(self, ticker: str) -> Dict[str, Any]:
         """
-        Resolve ticker using multi-tier strategy
-
+        Resolve ticker using NSE authoritative data
+        
+        Resolution order (7 tiers):
+        1. Active stock (direct match)
+        2. Symbol change (NSE authoritative - 100% confidence)
+        3. Name change (NSE authoritative - 100% confidence)
+        4. Fuzzy name match (fallback - 85%+ confidence)
+        5. Delisted (explicit)
+        6. Demerger (from corporate_events)
+        7. Not found (with suggestions)
+        
         Args:
             ticker: Stock ticker symbol to resolve
 
@@ -205,26 +373,43 @@ class TickerResolver:
                 'original_ticker': str,
                 'resolution_method': str,
                 'confidence': int (0-100),
-                'metadata': dict
+                'metadata': dict,
+                'entity_type': str
             }
         """
+        # Pre-process input
+        original_input = ticker
         ticker = ticker.upper().strip()
+        ticker = re.sub(r"\.", "", ticker)
+        
+        # Handle "Demerger of X" or "X Demerger"
+        demerger_keywords = ['DEMERGER OF', 'DEMERGER']
+        for kw in demerger_keywords:
+            if kw in ticker:
+                ticker = ticker.replace(kw, '').strip()
+        
+        # Handle common suffixes
+        suffixes = [' IND.', ' IND', ' LTD.', ' LTD', ' LIMITED', ' PVT', ' PRIVATE']
+        for s in suffixes:
+            if ticker.endswith(s):
+                ticker = ticker[:-len(s)].strip()
 
         # Tier 1: Check if ticker is currently active (no resolution needed)
         if ticker in self._active_tickers_cache:
             return {
                 'resolved_ticker': ticker,
-                'original_ticker': ticker,
+                'original_ticker': original_input,
                 'resolution_method': 'direct',
                 'confidence': 100,
                 'metadata': {'status': 'active', 'note': 'Ticker is currently active'},
                 'entity_type': 'stock'
             }
+        
         # Tier 1b: Check if ticker is an ETF (direct match)
         if ticker in getattr(self, '_etf_symbols', set()):
             return {
                 'resolved_ticker': ticker,
-                'original_ticker': ticker,
+                'original_ticker': original_input,
                 'resolution_method': 'etf_direct',
                 'confidence': 100,
                 'metadata': {'status': 'active', 'note': 'ETF ticker'},
@@ -232,560 +417,324 @@ class TickerResolver:
             }
         
         # Tier 1c: Check if ticker is an ETF (normalized match)
-        # Handles: 'NIFTY BEES' -> 'NIFTYBEES', 'NIFTYBEE' -> 'NIFTYBEES'
         normalized_ticker = self._normalize_etf_symbol(ticker)
         if normalized_ticker in getattr(self, '_normalized_etf_map', {}):
             actual_symbol = self._normalized_etf_map[normalized_ticker]
             return {
                 'resolved_ticker': actual_symbol,
-                'original_ticker': ticker,
+                'original_ticker': original_input,
                 'resolution_method': 'etf_normalized',
                 'confidence': 98,
                 'metadata': {'normalized_from': ticker, 'note': 'ETF symbol normalized'},
                 'entity_type': 'etf'
             }
 
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT symbol, is_active FROM stocks_master WHERE UPPER(symbol) = ?", (ticker,))
-            r = cursor.fetchone()
-            if r and str(r['symbol']).upper() in self._active_tickers_cache:
-                sym = str(r['symbol']).upper()
-                return {
-                    'resolved_ticker': sym,
-                    'original_ticker': ticker,
-                    'resolution_method': 'direct_lookup',
-                    'confidence': 99,
-                    'metadata': {'status': 'active'},
-                    'entity_type': 'stock'
-                }
-        except Exception:
-            pass
-
-        # Fuzzy matching for stocks and ETFs
-        if '%' not in ticker and '*' not in ticker:
-            # Try stock symbol fuzzy match
-            try:
-                active = list(self._active_tickers_cache)
-                matches = get_close_matches(ticker, active, n=1, cutoff=0.86)
-                if matches:
-                    m = matches[0]
-                    from difflib import SequenceMatcher
-                    sim = SequenceMatcher(None, ticker, m).ratio()
-                    conf = int(sim*100)
-                    return {
-                        'resolved_ticker': m,
-                        'original_ticker': ticker,
-                        'resolution_method': 'symbol_fuzzy',
-                        'confidence': conf,
-                        'metadata': {'matched_symbol': m, 'similarity_score': sim},
-                        'entity_type': 'stock'
-                    }
-            except Exception:
-                pass
-            
-            # Try ETF symbol fuzzy match
-            try:
-                etf_symbols_list = list(getattr(self, '_etf_symbols', set()))
-                if etf_symbols_list:
-                    etf_matches = get_close_matches(ticker, etf_symbols_list, n=1, cutoff=0.86)
-                    if etf_matches:
-                        matched_etf = etf_matches[0]
-                        from difflib import SequenceMatcher
-                        sim = SequenceMatcher(None, ticker, matched_etf).ratio()
-                        conf = int(sim*100)
-                        return {
-                            'resolved_ticker': matched_etf,
-                            'original_ticker': ticker,
-                            'resolution_method': 'etf_fuzzy',
-                            'confidence': conf,
-                            'metadata': {'matched_symbol': matched_etf, 'similarity_score': sim},
-                            'entity_type': 'etf'
-                        }
-            except Exception:
-                pass
-
-        # Index resolution attempt
-        idx = self._resolve_index(ticker)
+        # Tier 1d: Index resolution
+        idx = self.resolve_index(ticker)
         if idx:
             return idx
 
-        # Tier 2: Fuzzy name matching (company_name in stocks_master)
-        fuzzy_result = self._resolve_via_fuzzy_matching(ticker)
-        if fuzzy_result and fuzzy_result['confidence'] >= 90:
-            return fuzzy_result
+        cur = self.conn.cursor()
+        
+        # Tier 2: Symbol change (Recursive A -> B -> C)
+        # We loop to follow the chain of changes
+        current_symbol = ticker
+        chain = []
+        max_hops = 5
+        
+        for _ in range(max_hops):
+            try:
+                cur.execute("""
+                    SELECT new_symbol, change_date 
+                    FROM symbol_change_events 
+                    WHERE old_symbol = ?
+                    ORDER BY change_date DESC LIMIT 1
+                """, (current_symbol,))
+                result = cur.fetchone()
+                
+                if result:
+                    new_sym = result['new_symbol'] if isinstance(result, sqlite3.Row) else result[0]
+                    change_date = result['change_date'] if isinstance(result, sqlite3.Row) else result[1]
+                    
+                    if new_sym:
+                        chain.append((current_symbol, new_sym, change_date))
+                        current_symbol = new_sym
+                    else:
+                        break
+                else:
+                    break
+            except Exception:
+                break
+        
+        if chain:
+            # We found at least one change. 'current_symbol' is the final one.
+            final_symbol = current_symbol
+            is_active = final_symbol.upper() in self._active_tickers_cache
+            
+            # Construct chain string for metadata
+            chain_str = " -> ".join([c[0] for c in chain] + [final_symbol])
+            
+            return {
+                'resolved_ticker': final_symbol.upper(),
+                'original_ticker': original_input,
+                'resolution_method': 'symbol_change',
+                'confidence': 100,
+                'metadata': {
+                    'change_chain': chain_str,
+                    'final_change_date': chain[-1][2],
+                    'note': 'NSE authoritative symbol change (recursive)',
+                    'status': 'active' if is_active else 'inactive'
+                },
+                'entity_type': 'stock'
+            }
+        
+        # Tier 2.5: High-confidence Fuzzy Match on Active Tickers (Pre-Name Change)
+        # This prevents "Tata Motors" -> "TMPV" (Name Change) when "TMCV" exists
+        # We prioritize an existing ACTIVE stock over a historical name change if the name is very similar
+        # Thanks to suffix normalization, "TATA MOTORS" matches "TATA MOTORS LIMITED" with 98% confidence
+        fuzzy_match = self._fuzzy_match_active(ticker)
+        if fuzzy_match and fuzzy_match['confidence'] >= 85:  # Safe threshold thanks to normalization
+             return {
+                'resolved_ticker': fuzzy_match['symbol'],
+                'original_ticker': original_input,
+                'resolution_method': 'fuzzy_match_high_conf',
+                'confidence': fuzzy_match['confidence'],
+                'metadata': {'match_name': fuzzy_match['name'], 'note': 'High confidence fuzzy match prioritized'},
+                'entity_type': 'stock'
+            }
 
-        # Tier 3: Alias lineage traversal
+        # Tier 3: Name change (100% authoritative NSE data)
+        
+        # Tier 3: Name change (100% authoritative NSE data)
         try:
-            def clean(s):
-                x = str(s or '')
-                x = re.sub(r"\s+(Ltd\.?|Limited|Private|Pvt\.?|Corporation|Corp\.?|Inc\.?)$", "", x, flags=re.IGNORECASE)
-                x = re.sub(r"[&()\[\].,]", " ", x)
-                x = " ".join(x.split())
-                return x.strip().upper()
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                SELECT new_symbol, new_name, effective_date, confidence, notes
-                FROM alias_events
-                WHERE old_symbol = ?
-                ORDER BY effective_date DESC, id DESC
-                """,
-                (ticker,)
-            )
-            rows = cursor.fetchall()
-            for row in rows:
-                ns = row['new_symbol'] if isinstance(row, sqlite3.Row) else row[0]
-                if ns and ns.upper() in self._active_tickers_cache:
-                    conf = row['confidence'] if isinstance(row, sqlite3.Row) else row[3]
-                    reason = row['notes'] if isinstance(row, sqlite3.Row) else (row[4] if len(row) > 4 else None)
-                    # Prefer canonical company name for display
-                    disp_name = None
-                    try:
-                        c2 = self.conn.cursor()
-                        c2.execute("SELECT company_name FROM company_names_canonical WHERE symbol = ?", (ns.upper(),))
-                        rr = c2.fetchone()
-                        if rr:
-                            disp_name = rr['company_name'] if isinstance(rr, sqlite3.Row) else rr[0]
-                    except Exception:
-                        pass
+            cur.execute("""
+                SELECT symbol, new_name, change_date
+                FROM name_change_events
+                WHERE old_name LIKE ? OR new_name LIKE ?
+                ORDER BY change_date DESC LIMIT 1
+            """, (f"%{ticker}%", f"%{ticker}%"))
+            result = cur.fetchone()
+            
+            if result:
+                sym = result['symbol'] if isinstance(result, sqlite3.Row) else result[0]
+                if sym:
+                    is_active = sym.upper() in self._active_tickers_cache
+                    
+                    # If the name change result is inactive, but we have a decent fuzzy match (e.g. >80%),
+                    # prefer the fuzzy match.
+                    if not is_active and fuzzy_match and fuzzy_match['confidence'] > 80:
+                         return {
+                            'resolved_ticker': fuzzy_match['symbol'],
+                            'original_ticker': original_input,
+                            'resolution_method': 'fuzzy_match_fallback',
+                            'confidence': fuzzy_match['confidence'],
+                            'metadata': {'match_name': fuzzy_match['name'], 'note': 'Fuzzy match preferred over inactive name change'},
+                            'entity_type': 'stock'
+                        }
+
                     return {
-                        'resolved_ticker': ns.upper(),
+                        'resolved_ticker': sym.upper(),
                         'original_ticker': ticker,
-                        'resolution_method': 'alias_lineage',
-                        'confidence': int(round(float(conf or 0)*100)),
+                        'resolution_method': 'name_change',
+                        'confidence': 100,
                         'metadata': {
-                            'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
-                            'new_name': (disp_name or (row['new_name'] if isinstance(row, sqlite3.Row) else row[1])),
-                            'reason': reason
+                            'new_name': result['new_name'] if isinstance(result, sqlite3.Row) else result[1],
+                            'change_date': result['change_date'] if isinstance(result, sqlite3.Row) else result[2],
+                            'note': 'NSE authoritative name change',
+                            'status': 'active' if is_active else 'inactive'
                         },
                         'entity_type': 'stock'
                     }
-            cursor.execute("SELECT company_name FROM stocks_master WHERE symbol = ?", (ticker,))
-            r = cursor.fetchone()
-            if r:
-                cname = r['company_name'] if isinstance(r, sqlite3.Row) else r[0]
-                c = clean(cname)
-                cursor.execute(
-                    """
-                    SELECT new_symbol, new_name, effective_date, confidence, notes
-                    FROM alias_events
-                    WHERE UPPER(old_name) LIKE ? OR UPPER(new_name) LIKE ?
-                    ORDER BY effective_date DESC, id DESC
-                    """,
-                    (f"%{c}%", f"%{c}%")
-                )
-                rows = cursor.fetchall()
-                for row in rows:
-                    ns = row['new_symbol'] if isinstance(row, sqlite3.Row) else row[0]
-                    if ns and ns.upper() in self._active_tickers_cache:
-                        conf = row['confidence'] if isinstance(row, sqlite3.Row) else row[3]
-                        reason = row['notes'] if isinstance(row, sqlite3.Row) else (row[4] if len(row) > 4 else None)
-                        # Prefer canonical company name for display
-                        disp_name = None
-                        try:
-                            c2 = self.conn.cursor()
-                            c2.execute("SELECT company_name FROM company_names_canonical WHERE symbol = ?", (ns.upper(),))
-                            rr = c2.fetchone()
-                            if rr:
-                                disp_name = rr['company_name'] if isinstance(rr, sqlite3.Row) else rr[0]
-                        except Exception:
-                            pass
-                        return {
-                            'resolved_ticker': ns.upper(),
-                            'original_ticker': ticker,
-                            'resolution_method': 'alias_lineage',
-                            'confidence': int(round(float(conf or 0)*100)),
-                            'metadata': {
-                                'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
-                                'new_name': (disp_name or (row['new_name'] if isinstance(row, sqlite3.Row) else row[1])),
-                                'reason': reason
-                            },
-                            'entity_type': 'stock'
-                        }
-            tc = clean(ticker)
-            cursor.execute(
-                """
-                SELECT new_symbol, new_name, effective_date, confidence
-                FROM alias_events
-                WHERE UPPER(old_name) LIKE ? OR UPPER(new_name) LIKE ?
-                ORDER BY effective_date DESC, id DESC
-                """,
-                (f"%{tc}%", f"%{tc}%")
-            )
-            rows = cursor.fetchall()
-            for row in rows:
-                ns = row['new_symbol'] if isinstance(row, sqlite3.Row) else row[0]
-                if ns and ns.upper() in self._active_tickers_cache:
-                    conf = row['confidence'] if isinstance(row, sqlite3.Row) else row[3]
+            else:
+                nc_fuzzy = self._fuzzy_match_name_change(original_input)
+                if nc_fuzzy and nc_fuzzy.get('confidence', 0) >= 75:
                     return {
-                        'resolved_ticker': ns.upper(),
+                        'resolved_ticker': nc_fuzzy['symbol'],
+                        'original_ticker': original_input,
+                        'resolution_method': 'name_change_fuzzy',
+                        'confidence': nc_fuzzy['confidence'],
+                        'metadata': {'match_name': nc_fuzzy['name']},
+                        'entity_type': 'stock'
+                    }
+        except Exception as e:
+            pass
+        
+        # Tier 4: Delisted (explicit)
+        try:
+            cur.execute("""
+                SELECT symbol, last_traded_date, delisting_reason
+                FROM delisting_events
+                WHERE symbol = ?
+            """, (ticker,))
+            result = cur.fetchone()
+            
+            if result:
+                return {
+                    'resolved_ticker': None,
+                    'original_ticker': ticker,
+                    'resolution_method': 'delisted',
+                    'confidence': 100,
+                    'metadata': {
+                        'status': 'DELISTED',
+                        'last_traded_date': result['last_traded_date'] if isinstance(result, sqlite3.Row) else result[1],
+                        'reason': result['delisting_reason'] if isinstance(result, sqlite3.Row) else result[2]
+                    },
+                    'entity_type': 'stock'
+                }
+        except Exception as e:
+            pass
+        
+        # Tier 5: Demerger (from corporate_events table)
+        try:
+            cur.execute("""
+                SELECT symbol, ex_date, purpose
+                FROM corporate_events
+                WHERE event_type = 'DEMERGER'
+                AND (symbol = ? OR purpose LIKE ?)
+                ORDER BY ex_date DESC
+                LIMIT 1
+            """, (ticker, f"%{ticker}%"))
+            result = cur.fetchone()
+            
+            if result:
+                parent_symbol = result['symbol'] if isinstance(result, sqlite3.Row) else result[0]
+                ex_date = result['ex_date'] if isinstance(result, sqlite3.Row) else result[1]
+                
+                from datetime import datetime, timedelta
+                try:
+                    ex_dt = datetime.strptime(str(ex_date), '%d-%b-%Y')
+                except Exception:
+                    try:
+                        ex_dt = datetime.strptime(str(ex_date), '%Y-%m-%d')
+                    except Exception:
+                        ex_dt = None
+                
+                children: List[str] = []
+                if ex_dt:
+                    try:
+                        cur.execute("""
+                            SELECT symbol, listing_date
+                            FROM stocks_master
+                            WHERE listing_date IS NOT NULL
+                        """)
+                        rows = cur.fetchall()
+                        for r in rows:
+                            sym = r['symbol'] if isinstance(r, sqlite3.Row) else r[0]
+                            ld = r['listing_date'] if isinstance(r, sqlite3.Row) else r[1]
+                            if not ld:
+                                continue
+                            # Parse listing_date stored as 'DD-MMM-YYYY'
+                            try:
+                                ld_dt = datetime.strptime(str(ld), '%d-%b-%Y')
+                            except Exception:
+                                try:
+                                    ld_dt = datetime.strptime(str(ld), '%Y-%m-%d')
+                                except Exception:
+                                    continue
+                            if abs((ld_dt - ex_dt).days) <= 30:
+                                children.append(str(sym).upper())
+                    except Exception:
+                        pass
+                
+                if len(children) == 1:
+                    return {
+                        'resolved_ticker': children[0],
                         'original_ticker': ticker,
-                        'resolution_method': 'alias_lineage',
-                        'confidence': int(round(float(conf or 0)*100)),
+                        'resolution_method': 'demerger_single_child',
+                        'confidence': 85,
                         'metadata': {
-                            'effective_date': row['effective_date'] if isinstance(row, sqlite3.Row) else row[2],
-                            'new_name': row['new_name'] if isinstance(row, sqlite3.Row) else row[1]
+                            'parent_symbol': parent_symbol,
+                            'demerger_date': ex_date
+                        },
+                        'entity_type': 'stock'
+                    }
+                elif len(children) > 1:
+                    return {
+                        'resolved_ticker': None,
+                        'original_ticker': ticker,
+                        'resolution_method': 'demerger_multiple_children',
+                        'confidence': 75,
+                        'metadata': {
+                            'parent_symbol': parent_symbol,
+                            'children': children,
+                            'note': 'Demerger created multiple entities - please specify which one'
                         },
                         'entity_type': 'stock'
                     }
         except Exception:
             pass
-
-        # Tier 4: Demerger correlation (stock_aliases + CF-CA + timeline)
-        demerger_result = self._resolve_via_demerger_correlation(ticker)
-        if demerger_result:
-            return demerger_result
-
-        # Tier 5: Alias-only fallback when other signals are not found
-        alias_only = self._resolve_via_alias_only(ticker)
-        if alias_only:
-            return alias_only
-
-        # Tier 4: Not found - provide suggestions
+        
+        # Tier 6: Not found - provide suggestions
         suggestions = self._get_similar_tickers(ticker)
-        last_seen = self._check_historical_existence(ticker)
-
         return {
             'resolved_ticker': None,
             'original_ticker': ticker,
             'resolution_method': 'not_found',
             'confidence': 0,
             'metadata': {
-                'suggestions': suggestions,
-                'last_seen': last_seen
+                'suggestions': suggestions
             },
             'entity_type': 'unknown'
         }
 
-
-
-    def _resolve_index(self, text: str) -> Optional[Dict[str, Any]]:
-        q = str(text or '').strip()
-        if not q:
+    def _fuzzy_match_name_change(self, query: str) -> Optional[Dict[str, Any]]:
+        import difflib
+        q = str(query or "").upper().strip()
+        qn = self._normalize_company_name(q)
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                SELECT symbol, old_name, new_name
+                FROM name_change_events
+            """)
+            rows = cur.fetchall()
+        except Exception:
             return None
-        q_upper = q.upper()
-        try:
-            for name in self._index_names:
-                if q_upper == str(name).upper():
-                    return {
-                        'resolved_ticker': None,
-                        'original_ticker': q,
-                        'resolution_method': 'index_direct',
-                        'confidence': 100,
-                        'metadata': {'index_name': name},
-                        'entity_type': 'index',
-                        'resolved_index_name': name
-                    }
-        except Exception:
-            pass
-        norm_q = self._normalize_index_name(q_upper)
-        try:
-            tgt = self._normalized_index_map.get(norm_q)
-            if tgt:
-                return {
-                    'resolved_ticker': None,
-                    'original_ticker': q,
-                    'resolution_method': 'index_normalized',
-                    'confidence': 95,
-                    'metadata': {'index_name': tgt},
-                    'entity_type': 'index',
-                    'resolved_index_name': tgt
-                }
-        except Exception:
-            pass
-        try:
-            matches = get_close_matches(q_upper, [str(n).upper() for n in self._index_names], n=1, cutoff=0.8)
-            if matches:
-                m = matches[0]
-                from difflib import SequenceMatcher
-                sim = SequenceMatcher(None, q_upper, m).ratio()
-                orig = None
-                for n in self._index_names:
-                    if str(n).upper() == m:
-                        orig = n
-                        break
-                if orig:
-                    return {
-                        'resolved_ticker': None,
-                        'original_ticker': q,
-                        'resolution_method': 'index_fuzzy',
-                        'confidence': int(sim*100),
-                        'metadata': {'index_name': orig, 'similarity_score': sim},
-                        'entity_type': 'index',
-                        'resolved_index_name': orig
-                    }
-        except Exception:
-            pass
-        return None
-
-    def _resolve_via_demerger_correlation(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """
-        Resolve ticker by correlating:
-        1. Name changes in stock_aliases table
-        2. Demergers in CF-CA CSV
-        3. Timeline proximity (within 30 days)
-
-        Returns resolved ticker if correlation found, None otherwise
-        """
-        if self.cf_ca_data is None:
-            return None
-
-        try:
-            # Step 1: Find name changes for companies matching ticker pattern
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                SELECT old_name, new_name, nse_symbol, change_date, confidence
-                FROM stock_aliases
-                WHERE old_name LIKE ? OR new_name LIKE ?
-                ORDER BY confidence DESC
-                LIMIT 5
-            """, (f"%{ticker}%", f"%{ticker}%"))
-
-            name_changes = cursor.fetchall()
-
-            if not name_changes:
-                return None
-
-            # Step 2: For each name change, check if demerger occurred around same time
-            for name_change in name_changes:
-                new_name = name_change['new_name']
-                change_date_str = name_change['change_date']
-                nse_symbol = name_change['nse_symbol']
-
-                if not change_date_str:
+        best = None
+        best_score = 0.0
+        for r in rows:
+            sym = r['symbol'] if isinstance(r, sqlite3.Row) else r[0]
+            oldn = r['old_name'] if isinstance(r, sqlite3.Row) else r[1]
+            newn = r['new_name'] if isinstance(r, sqlite3.Row) else r[2]
+            for nm in (oldn, newn):
+                if not nm:
                     continue
+                nn = self._normalize_company_name(str(nm).upper())
+                score = difflib.SequenceMatcher(None, qn, nn).ratio()
+                if score > best_score:
+                    best_score = score
+                    best = {'symbol': str(sym).upper(), 'name': nm, 'confidence': int(score * 100)}
+        return best
 
-                try:
-                    change_date = datetime.strptime(change_date_str, '%Y-%m-%d')
-                except:
-                    try:
-                        change_date = datetime.strptime(change_date_str, '%d-%b-%Y')
-                    except:
-                        continue
-
-                date_min = (change_date - timedelta(days=30)).strftime('%d-%b-%Y')
-                date_max = (change_date + timedelta(days=30)).strftime('%d-%b-%Y')
-
-                company_keywords = new_name.split()[:3]
-                df = self.cf_ca_data
-                purposes = ['Demerger', 'Scheme of Arrangement', 'Amalgamation', 'Merger']
-                mask_purpose = df['PURPOSE'].str.contains('|'.join(purposes), case=False, na=False)
-                mask_company = df['COMPANY NAME'].str.contains('|'.join(company_keywords), case=False, na=False)
-                mask_symbol = False
-                if nse_symbol:
-                    mask_symbol = (df['SYMBOL'].astype(str).str.upper() == str(nse_symbol).upper())
-                try:
-                    ex_dates = pd.to_datetime(df['EX-DATE'], errors='coerce', format='%d-%b-%Y')
-                except Exception:
-                    ex_dates = pd.to_datetime(df['EX-DATE'], errors='coerce')
-                df = df.assign(__ex_date=ex_dates)
-                window_mask = (df['__ex_date'] >= pd.to_datetime(date_min)) & (df['__ex_date'] <= pd.to_datetime(date_max))
-                demergers = df[mask_purpose & (mask_company | mask_symbol) & window_mask]
-                if demergers.empty:
-                    date_min2 = (change_date - timedelta(days=365)).strftime('%d-%b-%Y')
-                    date_max2 = (change_date + timedelta(days=365)).strftime('%d-%b-%Y')
-                    window_mask2 = (df['__ex_date'] >= pd.to_datetime(date_min2)) & (df['__ex_date'] <= pd.to_datetime(date_max2))
-                    demergers = df[mask_purpose & (mask_company | mask_symbol) & window_mask2]
-
-                if not demergers.empty:
-                    row = demergers.sort_values('__ex_date').iloc[0]
-                    resolved_symbol = row['SYMBOL']
-                    if resolved_symbol in self._active_tickers_cache:
-                        ex_date = row['__ex_date']
-                        days_apart = abs((change_date - ex_date.to_pydatetime()).days)
-                        if days_apart <= 7:
-                            confidence = 95
-                        elif days_apart <= 30:
-                            confidence = 90
-                        elif days_apart <= 180:
-                            confidence = 80
-                        elif days_apart <= 365:
-                            confidence = 70
-                        else:
-                            confidence = 60
-                        return {
-                            'resolved_ticker': resolved_symbol,
-                            'original_ticker': ticker,
-                            'resolution_method': 'demerger_correlation',
-                            'confidence': confidence,
-                            'metadata': {
-                                'old_company_name': name_change['old_name'],
-                                'new_company_name': new_name,
-                                'change_date': change_date_str,
-                                'demerger_date': row['EX-DATE'],
-                                'note': f"Ticker changed from {ticker} to {resolved_symbol}",
-                                'reason': str(row['PURPOSE'])
-                            }
-                        }
-
-            return None
-
-        except Exception as e:
-            print(f"[WARN] Demerger correlation failed: {e}")
-            return None
-
-    def _resolve_via_alias_only(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """
-        Resolve using stock_aliases table alone when CF-CA correlation is not available.
-
-        Strategy:
-        - Find alias rows where old_name/new_name contains the input
-        - Prefer rows with a non-empty nse_symbol that is active in stocks_master
-        - Use stored confidence (0-1) scaled to 0-100; default to 80 if missing
-        """
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                SELECT old_name, new_name, nse_symbol, change_date, confidence
-                FROM stock_aliases
-                WHERE old_name LIKE ? OR new_name LIKE ?
-                ORDER BY confidence DESC
-                LIMIT 5
-                """,
-                (f"%{ticker}%", f"%{ticker}%")
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                return None
-
-            for row in rows:
-                sym = (row[2] if isinstance(row, tuple) else row['nse_symbol'])
-                if not sym:
-                    continue
-                sym_up = str(sym).upper()
-                if sym_up in self._active_tickers_cache:
-                    from difflib import SequenceMatcher
-                    def clean_txt(s):
-                        x = str(s or '')
-                        x = re.sub(r"\s+(Ltd\.?|Limited|Private|Pvt\.?|Corporation|Corp\.?|Inc\.?)$", "", x, flags=re.IGNORECASE)
-                        x = re.sub(r"[&()\[\].,]", " ", x)
-                        x = " ".join(x.split())
-                        return x.strip().upper()
-                    t_clean = clean_txt(ticker)
-                    old_name = row[0] if isinstance(row, tuple) else row['old_name']
-                    new_name = row[1] if isinstance(row, tuple) else row['new_name']
-                    oc = clean_txt(old_name)
-                    nc = clean_txt(new_name)
-                    sim_old = SequenceMatcher(None, t_clean, oc).ratio() if oc else 0.0
-                    sim_new = SequenceMatcher(None, t_clean, nc).ratio() if nc else 0.0
-                    sim_max = max(sim_old, sim_new)
-                    if t_clean == sym_up or sim_max >= 0.88:
-                        conf_val = (row[4] if isinstance(row, tuple) else row['confidence'])
-                        try:
-                            confidence = int(round(float(conf_val) * 100))
-                        except Exception:
-                            confidence = 80
-                        change_date = row[3] if isinstance(row, tuple) else row['change_date']
-                        return {
-                            'resolved_ticker': sym_up,
-                            'original_ticker': ticker,
-                            'resolution_method': 'alias_only',
-                            'confidence': confidence,
-                            'metadata': {
-                                'old_company_name': old_name,
-                                'new_company_name': new_name,
-                                'change_date': change_date,
-                                'note': f"Resolved via stock_aliases without CF-CA correlation",
-                                'reason': None
-                            }
-                        }
-        except Exception:
-            return None
-        return None
-
-    def _resolve_via_fuzzy_matching(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """
-        Resolve ticker by fuzzy matching on company_name in stocks_master
-
-        Examples:
-        - "TATAMOTORS" → "Tata Motors" → TCS (if similarity > 85%)
-        - "Tata Consultancy Services" → TCS
-        """
-        cursor = self.conn.cursor()
-
-        # Get all active companies
-        cursor.execute("""
+    def _get_similar_tickers(self, query: str) -> List[Dict[str, Any]]:
+        import difflib
+        q = str(query or "").upper().strip()
+        qn = self._normalize_company_name(q)
+        cur = self.conn.cursor()
+        cur.execute("""
             SELECT symbol, company_name
             FROM stocks_master
             WHERE is_active = 1
         """)
+        rows = cur.fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            sym = row['symbol'] if isinstance(row, sqlite3.Row) else row[0]
+            name = row['company_name'] if isinstance(row, sqlite3.Row) else row[1]
+            su = str(sym or "").upper()
+            nu = self._normalize_company_name(str(name or ""))
+            s_sim = difflib.SequenceMatcher(None, q, su).ratio()
+            n_sim = difflib.SequenceMatcher(None, qn, nu).ratio()
+            sim = max(s_sim, n_sim)
+            items.append({
+                'symbol': su,
+                'name': str(name or ""),
+                'confidence': int(sim * 100)
+            })
+        items.sort(key=lambda x: (-x['confidence'], len(x['name'])))
+        return items[:5]
 
-        companies = cursor.fetchall()
 
-        # Try fuzzy matching on company names
-        company_names = [row['company_name'] for row in companies if row['company_name']]
-        matches = get_close_matches(ticker, company_names, n=1, cutoff=0.7)
-
-        if matches:
-            matched_name = matches[0]
-
-            # Get symbol for matched company
-            cursor.execute("""
-                SELECT symbol FROM stocks_master
-                WHERE company_name = ? AND is_active = 1
-            """, (matched_name,))
-
-            result = cursor.fetchone()
-            if result:
-                # Calculate similarity score
-                from difflib import SequenceMatcher
-                similarity = SequenceMatcher(None, ticker.lower(), matched_name.lower()).ratio()
-                confidence = int(similarity * 100)
-
-                return {
-                    'resolved_ticker': result['symbol'],
-                    'original_ticker': ticker,
-                    'resolution_method': 'fuzzy_name_match',
-                    'confidence': confidence,
-                    'metadata': {
-                        'matched_company_name': matched_name,
-                        'similarity_score': similarity,
-                        'note': f"Matched '{ticker}' to company name '{matched_name}'"
-                    }
-                }
-            else:
-                from difflib import SequenceMatcher
-                similarity = SequenceMatcher(None, ticker.lower(), matched_name.lower()).ratio()
-                cursor.execute("SELECT old_symbol, new_symbol, old_name, new_name, confidence FROM alias_events WHERE UPPER(old_name) = ? ORDER BY effective_date DESC, id DESC", (matched_name.upper(),))
-                ev = cursor.fetchone()
-                if ev:
-                    ns = ev['new_symbol'] if isinstance(ev, sqlite3.Row) else ev[1]
-                    if ns and ns.upper() in self._active_tickers_cache:
-                        conf = ev['confidence'] if isinstance(ev, sqlite3.Row) else ev[4]
-                        return {
-                            'resolved_ticker': ns.upper(),
-                            'original_ticker': ticker,
-                            'resolution_method': 'alias_lineage',
-                            'confidence': int(round(min(1.0, float(conf or 0)) * 100)),
-                            'metadata': {
-                                'matched_company_name': matched_name,
-                                'similarity_score': similarity
-                            }
-                        }
-
-        return None
-
-    def _get_similar_tickers(self, ticker: str, limit: int = 5) -> List[str]:
-        """Get similar ticker suggestions using difflib"""
-        matches = get_close_matches(ticker, self._active_tickers_cache, n=limit, cutoff=0.6)
-        return matches
-
-    def _check_historical_existence(self, ticker: str) -> Optional[str]:
-        """Check if ticker existed in the past (in daily_ohlc historical data)"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT MAX(date) as last_seen
-            FROM daily_ohlc
-            WHERE symbol = ?
-        """, (ticker,))
-
-        result = cursor.fetchone()
-        if result and result['last_seen']:
-            return result['last_seen']
-
-        return None
 
     def refresh_cache(self):
         self._active_tickers_cache = self._load_active_tickers()
