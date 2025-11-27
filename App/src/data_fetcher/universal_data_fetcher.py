@@ -908,7 +908,9 @@ class UniversalDataFetcher:
                 
                 if entity_type == 'index':
                     # Use live_index for indices
-                    return self.jugaad.live_index(symbol)
+                    # Bridge symbol for external API compatibility (same as option chains)
+                    sym_bridged = self._bridge_index_symbol_for_external(symbol)
+                    return self.jugaad.live_index(sym_bridged)
                 else:
                     # Use stock_quote for stocks and ETFs (both work with stock_quote)
                     return self.jugaad.stock_quote(symbol)
@@ -1344,7 +1346,10 @@ class UniversalDataFetcher:
                     added = []
                     if isinstance(out, dict):
                         for k, v in out.items():
-                            col = k if k else output_names[0]
+                            # FIX: Use indicator name + output name to avoid collisions (e.g. BBANDS_upperband)
+                            col_suffix = k if k else output_names[0]
+                            col = f"{spec['name']}_{col_suffix}" if len(output_names) > 1 else spec['name']
+                            
                             arr = np.asarray(v)
                             if arr.ndim > 1:
                                 arr = arr.reshape(-1)
@@ -1362,8 +1367,9 @@ class UniversalDataFetcher:
                             df[col] = arr
                             added.append(col)
                     elif isinstance(out, pd.DataFrame):
-                        for i, col in enumerate(out.columns):
-                            name = output_names[i] if i < len(output_names) and output_names[i] else f"{spec['name']}_{i}"
+                        for i, col_name in enumerate(out.columns):
+                            # FIX: Use indicator name + column name
+                            name = f"{spec['name']}_{col_name}"
                             arr = np.asarray(out.iloc[:, i].values)
                             m = arr.shape[0]
                             n = len(df)
@@ -1380,8 +1386,13 @@ class UniversalDataFetcher:
                             added.append(name)
                     elif isinstance(out, (np.ndarray, list)):
                         if isinstance(out, list) and len(out) > 1 and all(hasattr(x, '__len__') for x in out):
-                            cols_to_use = output_names if len(output_names) >= len(out) else [f"{spec['name']}__output_{i}" for i in range(len(out))]
+                            # Multiple outputs (list of arrays)
+                            cols_to_use = output_names if len(output_names) >= len(out) else [f"output_{i}" for i in range(len(out))]
                             for i, series in enumerate(out):
+                                # FIX: Use indicator name + output name
+                                col_name = cols_to_use[i]
+                                full_name = f"{spec['name']}_{col_name}" if len(out) > 1 else spec['name']
+                                
                                 arr = np.asarray(series)
                                 if arr.ndim > 1:
                                     arr = arr.reshape(-1)
@@ -1396,12 +1407,14 @@ class UniversalDataFetcher:
                                         if m > 0:
                                             _pad[n-m:] = arr
                                         arr = _pad
-                                df[cols_to_use[i]] = arr
-                                added.append(cols_to_use[i])
+                                df[full_name] = arr
+                                added.append(full_name)
                         else:
+                            # Single output (array)
                             arr = np.asarray(out)
                             if arr.ndim == 1:
-                                name = output_names[0] if output_names else spec['name']
+                                # FIX: Use indicator name directly for single output
+                                name = spec['name']
                                 m = arr.shape[0]
                                 n = len(df)
                                 if m != n:
@@ -1416,8 +1429,12 @@ class UniversalDataFetcher:
                                 df[name] = arr
                                 added.append(name)
                             elif arr.ndim == 2:
-                                cols_to_use = output_names if len(output_names) >= arr.shape[1] else [f"{spec['name']}__output_{i}" for i in range(arr.shape[1])]
+                                cols_to_use = output_names if len(output_names) >= arr.shape[1] else [f"output_{i}" for i in range(arr.shape[1])]
                                 for i in range(arr.shape[1]):
+                                    # FIX: Use indicator name + output name
+                                    col_name = cols_to_use[i]
+                                    full_name = f"{spec['name']}_{col_name}"
+                                    
                                     colarr = arr[:, i]
                                     m = colarr.shape[0]
                                     n = len(df)
@@ -1430,11 +1447,12 @@ class UniversalDataFetcher:
                                             if m > 0:
                                                 _pad[n-m:] = colarr
                                             colarr = _pad
-                                    df[cols_to_use[i]] = colarr
-                                    added.append(cols_to_use[i])
+                                    df[full_name] = colarr
+                                    added.append(full_name)
                     else:
                         # Fallback: single series
-                        name = output_names[0] if output_names else spec['name']
+                        # FIX: Use indicator name directly
+                        name = spec['name']
                         df[name] = out
                         added.append(name)
                     print(f"[IND] func={spec['name']} type={type(out).__name__} outputs={output_names} added={added}")

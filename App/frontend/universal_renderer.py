@@ -265,6 +265,8 @@ def render_response(envelope: dict):
         return
     text = envelope.get('response') or ''
     sanitized = _sanitize_text(text)
+    if not sanitized.strip():
+        sanitized = (text or '').strip()
     tab_blocks = _extract_tab_blocks(text)
     render_narrative = True
     try:

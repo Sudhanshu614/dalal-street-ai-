@@ -429,10 +429,7 @@ class TickerResolver:
                 'entity_type': 'etf'
             }
 
-        # Tier 1d: Index resolution
-        idx = self.resolve_index(ticker)
-        if idx:
-            return idx
+        # Tier 1d: Index resolution - MOVED TO AFTER FUZZY MATCH (see after Tier 2.5)
 
         cur = self.conn.cursor()
         
@@ -502,6 +499,12 @@ class TickerResolver:
                 'metadata': {'match_name': fuzzy_match['name'], 'note': 'High confidence fuzzy match prioritized'},
                 'entity_type': 'stock'
             }
+        
+        # Tier 2.6: Index resolution (after stock fuzzy match to avoid false positives)
+        # Moved here from Tier 1d to ensure stocks like "Jio Financial Services" don't match to "Nifty Financial Services" index
+        idx = self.resolve_index(ticker)
+        if idx:
+            return idx
 
         # Tier 3: Name change (100% authoritative NSE data)
         

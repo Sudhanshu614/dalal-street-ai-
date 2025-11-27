@@ -46,6 +46,7 @@ App/src/utils/
 # ============================================
 App/database/namechange.csv
 App/database/symbolchange.csv
+App/database/stock_master.csv
 App/database/IPO-PastIssue-*.csv
 App/database/CF-CA-*.csv
 App/database/Company_Name_Changes_NSE.xlsx

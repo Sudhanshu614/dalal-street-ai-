@@ -526,10 +526,20 @@ async def lifespan(app: FastAPI):
         raise ValueError("GEMINI_API_KEY not configured")
     genai.configure(api_key=api_key)
     logger.info("-> Gemini API configured")
+    
+    # Import GenerationConfig for hallucination prevention
+    from google.generativeai.types import GenerationConfig
+    
     gemini_model = genai.GenerativeModel(
         model_name='gemini-2.5-flash',
         tools=[{'function_declarations': FUNCTION_DECLARATIONS}],
-        system_instruction=SYSTEM_PROMPT
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=GenerationConfig(
+            temperature=0.1,  # Lower temperature = less hallucination, more deterministic
+            top_p=0.8,
+            top_k=40,
+            max_output_tokens=5000,  # Prevent runaway generation
+        )
     )
     logger.info(f"-> Gemini model ready (gemini-2.5-flash with {len(FUNCTION_DECLARATIONS)} functions)")
     logger.info("BACKEND READY - Listening for requests...")
@@ -762,6 +772,44 @@ async def health_check():
     return health_status
 
 
+# ============================================================================
+# HELPER FUNCTIONS FOR LLM CONTEXT
+# ============================================================================
+
+def build_system_context(fetcher) -> Dict[str, Any]:
+    """
+    Build dynamic system context with current date/time
+    
+    Senior Dev: Zero hardcoding - all values computed at runtime
+    Injects metadata into chat history for LLM to use in date filters
+    
+    Args:
+        fetcher: UniversalDataFetcher instance with sqlite_last_updated
+        
+    Returns:
+        Dict with 'role' and 'parts' for Gemini chat history
+    """
+    now = datetime.now()
+    
+    return {
+        'role': 'user',
+        'parts': [f"""[SYSTEM CONTEXT - AUTOMATIC]
+Current Date: {now.strftime('%Y-%m-%d')}
+Current Time: {now.strftime('%H:%M:%S IST')}
+Current Day: {now.strftime('%A')}
+Database Last Updated: {fetcher.sqlite_last_updated}
+Historical Data Range: 2010-01-01 to {fetcher.sqlite_last_updated}
+Market Hours: 09:15-15:30 IST (Monday-Friday)
+
+Use this context for all date-based queries."""]
+    }
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
@@ -784,6 +832,16 @@ async def chat(request: ChatRequest):
         else:
             chat_history = []
 
+        # Inject dynamic system context (date/time) for hallucination prevention
+        # Only inject when starting new conversation
+        if not request.conversation_history:
+            context_msg = build_system_context(fetcher)
+            model_acknowledgment = {
+                'role': 'model',
+                'parts': ['Understood. I will use this context for date-based queries.']
+            }
+            chat_history = [context_msg, model_acknowledgment]
+        
         # Start chat session with Gemini
         chat = gemini_model.start_chat(history=chat_history)
 
@@ -835,7 +893,9 @@ async def chat(request: ChatRequest):
                                 if last_seen:
                                     msg += f"Last seen on {last_seen}. "
                                 if suggestions:
-                                    msg += f"Did you mean: {', '.join(suggestions[:5])}?"
+                                    # Senior Dev: Handle suggestions being list of dicts
+                                    sug_strs = [s.get('symbol', str(s)) if isinstance(s, dict) else str(s) for s in suggestions]
+                                    msg += f"Did you mean: {', '.join(sug_strs[:5])}?"
                                 else:
                                     msg += "Please check the symbol and try again."
                                 llm_response_text = msg
@@ -848,7 +908,8 @@ async def chat(request: ChatRequest):
                                     bad = ', '.join([u['original'] for u in unresolved][:5])
                                     msg += f"Unresolved: {bad}. "
                                 if suggestions:
-                                    msg += f"Suggestions: {', '.join(suggestions[:5])}"
+                                    sug_strs = [s.get('symbol', str(s)) if isinstance(s, dict) else str(s) for s in suggestions]
+                                    msg += f"Suggestions: {', '.join(sug_strs[:5])}"
                                 llm_response_text = msg
 
                             has_function_call = False
@@ -889,6 +950,21 @@ async def chat(request: ChatRequest):
         # Final safety conversion to handle any remaining protobuf objects
         if raw_results is not None:
             raw_results = json.loads(json.dumps(raw_results, default=str))
+
+        # Hallucination detection monitoring (pattern-based, user-first: log only, don't block)
+        if raw_results is None and llm_response_text:
+            import re
+            # Check if response contains financial/data patterns without calling functions
+            has_structured_data = bool(re.search(r'₹\s*[\d,]+|RS\s*[\d,]+|\d+\.\d+%|\d+\s*Cr|\d+\s*L', llm_response_text))
+            has_table = '\t' in llm_response_text
+            
+            if has_structured_data or has_table:
+                logger.warning(
+                    f"[HALLUCINATION DETECTED] Response contains data but no function was called.\n"
+                    f"Query: {request.query}\n"
+                    f"Response preview: {llm_response_text[:200]}"
+                )
+                # Don't block user - just log for monitoring and improvement
 
         interval = None
         date_range = None

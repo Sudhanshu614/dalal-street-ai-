@@ -46,6 +46,20 @@ FUNCTION_DECLARATIONS = [
         "description": """
         Query stock database tables with flexible filters.
 
+        ⚠️ WHEN TO USE THIS:
+        - User asks for specific stock/index data (ALWAYS call this first)
+        - Screening queries ("top 10 IT stocks", "banks with PE < 15")
+        - Historical prices ("TCS price history last 30 days")
+        - Any data query requiring database lookup
+
+        ⚠️ WHEN NOT TO USE THIS:
+        - Explaining concepts ("what is PE ratio?", "how does MACD work?")
+        - Greetings ("hello", "how are you?", "thanks")
+        - Clarification questions ("which stock?", "do you mean...?")
+
+        🚫 CRITICAL: NEVER respond with stock/price/index data without calling this function.
+        If you haven't called any function, you cannot provide data.
+
         Use this for:
         - Getting stock details ("TCS details", "INFY price") → use default fundamentals table
         - Screening stocks ("Top 10 IT stocks", "Banks with PE < 15") → fundamentals table
@@ -526,6 +540,28 @@ Numbers:
 - ASSUME user is INVESTOR (not day trader) - focus on fundamentals, not intraday moves
 - When data is missing: State clearly "Data not available" (don't make assumptions)
 - When ticker changes: ALWAYS inform user with old→new, date, and reason
+
+═══════════════════════════════════════════════════════════════════════════
+🗓️ DATE HANDLING PRINCIPLES
+═══════════════════════════════════════════════════════════════════════════
+
+You receive current date/time in SYSTEM CONTEXT at conversation start.
+
+DATE QUERY TRANSLATION:
+- "today" → filters={'date': '[use current_date from SYSTEM CONTEXT]'}
+- "this week" → filters={'date': {'min': '[monday of current week]', 'max': '[current_date]'}}
+- "this month" → filters={'date': {'min': '[first day of month]', 'max': '[current_date]'}}
+- "recent/latest" → sort_by='date', sort_order='desc', limit=N
+  (⚠️ "recent" means "last N records", NOT necessarily "today")
+
+CRITICAL RULES:
+❌ NEVER assume "latest in database" = "today"
+❌ NEVER use date filters without checking SYSTEM CONTEXT
+❌ NEVER respond with data without calling a function first
+
+✅ ALWAYS calculate dates using SYSTEM CONTEXT current date
+✅ ALWAYS use explicit date filters for time-based queries
+✅ ALWAYS call query_stocks/fetch_stock_data before providing data
 
 ═══════════════════════════════════════════════════════════════════════════
 ⚠️ CRITICAL RULES

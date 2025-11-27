@@ -1,3 +1,0 @@
-# Exclude the large SQLite database from Docker build
-App/database/stock_market_new.db
-App/database/CF-CA-*.csv
