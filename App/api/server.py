@@ -805,6 +805,89 @@ Use this context for all date-based queries."""]
     }
 
 
+def validate_response_with_llm(
+    query: str,
+    response_text: str,
+    function_called: Optional[str],
+    raw_results: Optional[Dict]
+) -> Dict[str, Any]:
+    """
+    Use LLM to validate its own response
+    
+    Senior Dev: Zero hardcoding - LLM is best judge of its own output
+    
+    Args:
+        query: Original user query
+        response_text: LLM's text response
+        function_called: Name of function called (if any)
+        raw_results: Function results (if any)
+        
+    Returns:
+        {
+            'requires_data': bool,
+            'function_was_called': bool,
+            'response_is_valid': bool,
+            'reason': str
+        }
+    """
+    # Build validation prompt
+    validation_prompt = f"""You are a quality control system analyzing your own previous response.
+
+Original user query: "{query}"
+Your response: "{response_text}"
+Function called: {function_called if function_called else "None"}
+Function returned data: {bool(raw_results and raw_results.get('count', 0) > 0)}
+
+Analyze if your response is valid by answering these questions:
+
+1. Does the user query require retrieving data from a database or API?
+   (e.g., stock prices, financial data, market indices, company info)
+   
+2. If yes, did you call a function to retrieve that data?
+
+3. Is your response valid and accurate?
+   - If query needs data and you called function: Valid
+   - If query needs data but you didn't call function: Invalid
+   - If query doesn't need data (greeting, explanation): Valid
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+    "requires_data": true or false,
+    "function_was_called": true or false,
+    "response_is_valid": true or false,
+    "reason": "brief explanation of why valid or invalid"
+}}"""
+
+    try:
+        # Use a separate model instance for validation to avoid chat history pollution
+        validation_model = genai.GenerativeModel(
+            model_name='gemini-2.5-flash',
+            generation_config=GenerationConfig(
+                temperature=0.0,  # Deterministic validation
+                response_mime_type="application/json"
+            )
+        )
+        
+        # Get validation
+        validation_response = validation_model.generate_content(validation_prompt)
+        
+        # Parse JSON response
+        import json
+        validation = json.loads(validation_response.text)
+        
+        return validation
+        
+    except Exception as e:
+        logger.error(f"[VALIDATION ERROR] Failed to validate response: {e}")
+        # Fallback: assume response is valid if validation fails
+        return {
+            'requires_data': False,
+            'function_was_called': bool(function_called),
+            'response_is_valid': True,
+            'reason': f'Validation error: {str(e)}'
+        }
+
+
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
@@ -941,6 +1024,115 @@ async def chat(request: ChatRequest):
         # If we hit max turns, log warning
         if current_turn >= max_function_turns:
             print(f"[WARNING] Max function call turns ({max_function_turns}) reached")
+
+        # ====================================================================
+        # LLM SELF-VALIDATION AND AUTO-RETRY (Zero Hardcoding)
+        # ====================================================================
+        # Senior Dev: Let LLM validate itself instead of hardcoded rules
+        
+        validation_result = None
+        retry_attempted = False
+        retry_succeeded = False
+        
+        # Only validate if LLM responded with text but didn't call function
+        if llm_response_text and not function_called:
+            try:
+                # Ask LLM to validate its own response
+                validation_result = validate_response_with_llm(
+                    query=request.query,
+                    response_text=llm_response_text,
+                    function_called=function_called,
+                    raw_results=raw_results
+                )
+                
+                logger.info(f"[VALIDATION] Result: {validation_result}")
+                
+                # Check if retry is needed
+                needs_retry = (
+                    validation_result['requires_data'] and 
+                    not validation_result['function_was_called'] and 
+                    not validation_result['response_is_valid']
+                )
+                
+                if needs_retry:
+                    retry_attempted = True
+                    logger.info(f"[AUTO-RETRY] Triggered. Reason: {validation_result['reason']}")
+                    
+                    # Build retry instruction using LLM's own reasoning
+                    retry_instruction = f"""[SYSTEM CORRECTION]
+
+Your previous response was invalid.
+Validation result: {validation_result['reason']}
+
+Analysis:
+- User query requires data: {validation_result['requires_data']}
+- You called a function: {validation_result['function_was_called']}
+- Response is valid: {validation_result['response_is_valid']}
+
+To answer correctly, you MUST:
+1. Call the appropriate function (query_stocks, fetch_stock_data, calculate_indicators, etc.)
+2. Wait for the function results
+3. Use those results to answer the user's question
+
+User query: {request.query}
+
+Please retry and call the necessary function."""
+                    
+                    # Execute retry (reuse same multi-turn logic)
+                    retry_response = chat.send_message(retry_instruction)
+                    retry_llm_text = ""
+                    retry_raw_results = None
+                    retry_function_called = None
+                    
+                    # Process retry response (same multi-turn loop)
+                    retry_turn = 0
+                    max_retry_turns = 3
+                    
+                    while retry_turn < max_retry_turns:
+                        retry_turn += 1
+                        has_retry_function_call = False
+                        
+                        if retry_response.candidates[0].content.parts:
+                            for part in retry_response.candidates[0].content.parts:
+                                if hasattr(part, 'function_call') and part.function_call:
+                                    has_retry_function_call = True
+                                    retry_function_called = part.function_call.name
+                                    
+                                    logger.info(f"[AUTO-RETRY] Function called: {retry_function_called}")
+                                    
+                                    # Execute function
+                                    retry_raw_results = execute_function_call(part.function_call)
+                                    
+                                    # Send result back to LLM
+                                    safe_retry_result = make_json_safe(retry_raw_results)
+                                    retry_response = chat.send_message({
+                                        'function_response': {
+                                            'name': retry_function_called,
+                                            'response': safe_retry_result
+                                        }
+                                    })
+                                    break
+                                    
+                                elif hasattr(part, 'text') and part.text:
+                                    retry_llm_text = part.text
+                                    break
+                        
+                        if not has_retry_function_call:
+                            break
+                    
+                    # If retry succeeded (function was called), use retry results
+                    if retry_function_called:
+                        llm_response_text = retry_llm_text
+                        raw_results = retry_raw_results
+                        function_called = retry_function_called
+                        retry_succeeded = True
+                        logger.info(f"[AUTO-RETRY] SUCCESS - Used function: {retry_function_called}")
+                    else:
+                        logger.warning(f"[AUTO-RETRY] FAILED - Retry also didn't call function")
+                        
+            except Exception as e:
+                logger.error(f"[AUTO-RETRY] Error during validation/retry: {e}")
+                # Continue with original response if validation/retry fails
 
         # Calculate latency
         end_time = datetime.now()
@@ -1079,7 +1271,11 @@ async def chat(request: ChatRequest):
                 "function_called": function_called,
                 "timestamp": end_time.isoformat(),
                 "interval": interval or "N/A",
-                "date_range": date_range or "Date not available"
+                "date_range": date_range or "Date not available",
+                # Auto-retry metadata (zero hardcoding - tracks LLM self-validation)
+                "retry_attempted": retry_attempted if 'retry_attempted' in locals() else False,
+                "retry_succeeded": retry_succeeded if 'retry_succeeded' in locals() else False,
+                "validation_reason": validation_result['reason'] if validation_result else None
             }
         )
 
