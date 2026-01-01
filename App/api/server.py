@@ -147,6 +147,8 @@ def execute_function_call(function_call):
 
         # Query with filters for a single or list of symbols
         elif function_name == 'query_stocks':
+            # Senior Dev: Create working copy early so ticker resolution can use it
+            pn = dict(params)
             filters = params.get('filters') or {}
             filter_key = None
             if 'symbol' in filters:
@@ -384,7 +386,7 @@ def execute_function_call(function_call):
 
         # Execute supported functions with possibly-resolved ticker(s)
         if function_name == 'query_stocks':
-            pn = dict(params)
+            # pn already created at start of query_stocks block (line 151)
             filters = pn.get('filters', {}) if isinstance(pn.get('filters'), dict) else {}
             if 'symbol' in pn:
                 sym = pn.pop('symbol')
