@@ -371,14 +371,25 @@ class BhavcopyDownloader:
         try:
             cursor = self.conn.cursor()
             if current_tickers:
-                placeholders = ','.join('?' * len(current_tickers))
-                cursor.execute(f"SELECT symbol FROM stocks_master WHERE is_active = 0 AND symbol IN ({placeholders})", list(current_tickers))
-                to_reactivate = [row['symbol'] for row in cursor.fetchall()]
+                # Senior Dev: Sqlite has a parameter limit (usually 999). Must batch.
+                current_list = list(current_tickers)
+                batch_size = 900
+                to_reactivate = []
+                
+                for i in range(0, len(current_list), batch_size):
+                    batch = current_list[i:i + batch_size]
+                    placeholders = ','.join('?' * len(batch))
+                    cursor.execute(f"SELECT symbol FROM stocks_master WHERE is_active = 0 AND symbol IN ({placeholders})", batch)
+                    to_reactivate.extend([row['symbol'] for row in cursor.fetchall()])
+                
                 if to_reactivate:
-                    ph2 = ','.join('?' * len(to_reactivate))
-                    cursor.execute(f"UPDATE stocks_master SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE symbol IN ({ph2})", to_reactivate)
+                    for i in range(0, len(to_reactivate), batch_size):
+                        batch = to_reactivate[i:i + batch_size]
+                        ph2 = ','.join('?' * len(batch))
+                        cursor.execute(f"UPDATE stocks_master SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE symbol IN ({ph2})", batch)
                 self.conn.commit()
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] Reactivation failed: {e}")
             pass
 
         # Load yesterday's tickers
@@ -420,25 +431,41 @@ class BhavcopyDownloader:
 
         # Update stocks_master table (mark inactive tickers)
         if disappeared_tickers:
-            placeholders = ','.join('?' * len(disappeared_tickers))
-            cursor.execute(f"""
-                UPDATE stocks_master
-                SET is_active = 0, updated_at = CURRENT_TIMESTAMP
-                WHERE symbol IN ({placeholders})
-            """, list(disappeared_tickers))
-            self.conn.commit()
+            try:
+                dis_list = list(disappeared_tickers)
+                batch_size = 900
+                for i in range(0, len(dis_list), batch_size):
+                    batch = dis_list[i:i + batch_size]
+                    placeholders = ','.join('?' * len(batch))
+                    cursor.execute(f"""
+                        UPDATE stocks_master
+                        SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE symbol IN ({placeholders})
+                    """, batch)
+                self.conn.commit()
+            except Exception as e:
+                print(f"[WARN] Deactivation failed: {e}")
 
         # Add new tickers to stocks_master (if not present)
         if new_tickers:
+            added_count = 0
             for ticker in new_tickers:
-                cursor.execute(
-                    """
-                    INSERT OR IGNORE INTO stocks_master (symbol, is_active)
-                    VALUES (?, 1)
-                    """,
-                    (ticker,)
-                )
+                try:
+                    # Senior Dev: stocks_master.company_name is NOT NULL and has no default.
+                    # We must provide it or the INSERT OR IGNORE will fail silently.
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO stocks_master (symbol, company_name, is_active)
+                        VALUES (?, ?, 1)
+                        """,
+                        (ticker, f"New Listing: {ticker}")
+                    )
+                    added_count += cursor.rowcount
+                except Exception as e:
+                    print(f"[WARN] Failed to insert {ticker}: {e}")
             self.conn.commit()
+            if added_count:
+                print(f"[LOG] Added {added_count} new tickers to stocks_master")
 
         # Update ISINs dynamically (bhavcopy/NSELIB)
         isin_updated = 0

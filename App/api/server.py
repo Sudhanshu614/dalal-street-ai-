@@ -15,6 +15,7 @@ from typing import Dict, List, Any, Optional
 from collections.abc import Iterable
 import ast
 import google.generativeai as genai
+from google.generativeai.types import GenerationConfig
 from datetime import datetime
 import sys
 import os
@@ -529,8 +530,6 @@ async def lifespan(app: FastAPI):
     genai.configure(api_key=api_key)
     logger.info("-> Gemini API configured")
     
-    # Import GenerationConfig for hallucination prevention
-    from google.generativeai.types import GenerationConfig
     
     gemini_model = genai.GenerativeModel(
         model_name='gemini-2.5-flash',
